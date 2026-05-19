@@ -1,5 +1,65 @@
+import base64
 import pytest
 from types import SimpleNamespace
+
+# abandon × 11 + "about"; testnet singlesig, fingerprint 73c5da0a
+TEST_MNEMONIC = (
+    "abandon abandon abandon abandon abandon abandon abandon abandon "
+    "abandon abandon abandon about"
+)
+
+# Scan/spend keys for a fake SP recipient (deterministic: priv = 0x01…01 / 0x02…02)
+_SCAN_PUB_HEX = "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+_SPEND_PUB_HEX = "024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+
+
+def _build_sp_psbt_bytes():
+    """Return raw bytes for a PSBTv2 with one P2WPKH input + one SP output.
+
+    Input key: m/84h/1h/0h/0/0 under the abandon×11+about mnemonic (testnet).
+    SP output: 99 000 sat, placeholder P2TR script, scan=0x01…, spend=0x02….
+    tx_modifiable_flags=0 marks it as final (required by BIP-375 Stage 3).
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.psbt import PSBT, InputScope, OutputScope, DerivationPath
+    from embit.psbtv2_sp import SilentPaymentData
+    from embit import ec
+    from embit.script import p2wpkh, Script
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    fingerprint = root.child(0).fingerprint
+    child = root.derive("m/84h/1h/0h/0/0")
+    pub = child.get_public_key()
+
+    scan_pub = ec.PublicKey.parse(bytes.fromhex(_SCAN_PUB_HEX))
+    spend_pub = ec.PublicKey.parse(bytes.fromhex(_SPEND_PUB_HEX))
+
+    psbt = PSBT.create_v2()
+
+    inp = InputScope()
+    inp.txid = bytes(32)
+    inp.vout = 0
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2wpkh(pub))
+    inp.bip32_derivations[pub] = DerivationPath(
+        fingerprint, parse_path("m/84h/1h/0h/0/0")
+    )
+    psbt.add_input(inp)
+
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = Script(b"\x51\x20" + bytes(32))  # placeholder P2TR
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    return psbt.serialize()
 
 
 class _FakePub:
@@ -173,3 +233,139 @@ def test_has_sp_outputs_returns_false_when_attribute_missing(m5stickv):
     signer.psbt = SimpleNamespace(outputs=[SimpleNamespace(), SimpleNamespace()])
 
     assert signer.has_sp_outputs() is False
+
+
+# ---------------------------------------------------------------------------
+# End-to-end SP signing tests using the real PSBTSigner + Krux wallet
+# ---------------------------------------------------------------------------
+
+
+def _make_sp_wallet():
+    """Return a Krux Wallet loaded with the abandon×11+about mnemonic (testnet)."""
+    from embit.networks import NETWORKS
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+
+    return Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+
+
+def test_sp_signing_detects_sp_outputs(m5stickv):
+    """PSBTSigner must recognise the SP output at load time."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_bytes()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    assert signer.has_sp_outputs()
+
+
+def test_sp_signing_p2wpkh_adds_ecdh_shares(m5stickv):
+    """After sign(), every input must carry an ECDH share for the SP scan key."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_bytes()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+    inp = signer.psbt.inputs[0]
+
+    assert scan_key_bytes in inp.sp_ecdh_shares
+    share = inp.sp_ecdh_shares[scan_key_bytes]
+    assert len(share) == 33, "ECDH share must be a compressed EC point (33 bytes)"
+
+
+def test_sp_signing_adds_dleq_proofs(m5stickv):
+    """After sign(), every input must carry a DLEQ proof for the SP scan key."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_bytes()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+    inp = signer.psbt.inputs[0]
+
+    assert scan_key_bytes in inp.sp_dleq_proofs
+    proof = inp.sp_dleq_proofs[scan_key_bytes]
+    assert len(proof) == 64, "DLEQ proof must be 64 bytes (two 32-byte scalars)"
+
+
+def test_sp_signing_discards_incoming_fields(m5stickv):
+    """Coordinator-supplied SP fields must be discarded and replaced by Krux-derived ones."""
+    from embit.psbt import PSBT
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_bytes()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+
+    # Pre-populate the parsed PSBT with fake coordinator-supplied SP fields.
+    dummy_scan = b"\x02" + b"\xff" * 32  # recognisably wrong key
+    signer.psbt.inputs[0].sp_ecdh_shares[dummy_scan] = b"\x03" + b"\xaa" * 32
+    signer.psbt.inputs[0].sp_dleq_proofs[dummy_scan] = b"\xbb" * 64
+
+    signer.sign()
+
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+    inp = signer.psbt.inputs[0]
+
+    # Dummy key must be gone; real scan key must be present.
+    assert dummy_scan not in inp.sp_ecdh_shares
+    assert scan_key_bytes in inp.sp_ecdh_shares
+
+
+def test_sp_signing_preserves_psbt_version_2(m5stickv):
+    """Trimmed PSBT after sign() must remain PSBTv2 (version field == 2)."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_bytes()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    assert signer.psbt.version == 2
+
+
+def test_sp_fields_survive_serialization(m5stickv):
+    """SP ECDH shares and DLEQ proofs must survive a serialize → parse round-trip."""
+    from embit.psbt import PSBT
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_bytes()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+    original_share = signer.psbt.inputs[0].sp_ecdh_shares[scan_key_bytes]
+
+    # Round-trip through serialization.
+    reparsed = PSBT.parse(signer.psbt.serialize())
+    assert reparsed.version == 2
+    assert scan_key_bytes in reparsed.inputs[0].sp_ecdh_shares
+    assert reparsed.inputs[0].sp_ecdh_shares[scan_key_bytes] == original_share
+
+
+def test_sp_signing_also_signs_input(m5stickv):
+    """After sign(), the P2WPKH input must carry a partial signature (witness sig)."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_bytes()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    inp = signer.psbt.inputs[0]
+    has_partial = bool(inp.partial_sigs)
+    has_witness = bool(inp.final_scriptwitness)
+    assert has_partial or has_witness, "Input must be signed after sign()"
