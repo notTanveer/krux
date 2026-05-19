@@ -189,10 +189,14 @@ class PSBTSigner:
         # only fires when the PSBT actually carries SP outputs, so SP-naive
         # flows pay zero cost.
         if self.has_sp_outputs():
-            from .silent_payments import validate_eligibility, validate as sp_validate
+            from .silent_payments import validate_eligibility
 
+            # Only check policy eligibility at load time.  Full BIP-375
+            # structural validation (including ECDH-coverage Stage 2) runs
+            # after _populate_silent_payment_outputs() in sign(), because
+            # PSBTv2 outputs require placeholder scripts that trigger a
+            # false-positive Stage 2 failure before ECDH shares are present.
             validate_eligibility(self.policy)
-            sp_validate(self.psbt, skip_output_scripts=True)
 
     def has_sp_outputs(self):
         """Returns True if any output carries BIP-375 Silent Payment data"""
@@ -464,6 +468,66 @@ class PSBTSigner:
 
         return messages, fee_percent
 
+    def _sp_aux_rand(self):
+        """Generate 32-byte auxiliary randomness for DLEQ proof generation.
+
+        Mixes time.ticks_us() with a wallet-keyed nonce (sha256 of the private
+        key material over the serialized PSBT) so the output is unpredictable
+        to any observer who does not know the wallet root private key — even if
+        the timer source is weak or predictable.
+
+        Uses psbt.serialize() (not psbt.tx.serialize()) because SP outputs may
+        have None script_pubkeys before derivation, which would cause
+        TransactionOutput.write_to() to crash.
+        """
+        import hashlib
+        import time
+
+        try:
+            tick_val = time.ticks_us()
+        except AttributeError:
+            tick_val = int(time.time() * 1_000_000)
+
+        tick = (tick_val & 0xFFFFFFFF).to_bytes(4, "little")
+
+        # wallet_nonce = sha256(root_secret || fingerprint || sha256(psbt_bytes))
+        # Binding to root.secret ensures entropy is secret to external observers.
+        key_secret = self.wallet.key.root.secret
+        psbt_hash = hashlib.sha256(self.psbt.serialize()).digest()
+        wallet_nonce = hashlib.sha256(
+            key_secret + self.wallet.key.fingerprint + psbt_hash
+        ).digest()
+
+        return hashlib.sha256(tick + wallet_nonce).digest()
+
+    def _populate_silent_payment_outputs(self):
+        """Discard incoming SP fields and compute fresh ECDH shares + DLEQ proofs.
+
+        Incoming SP data is explicitly cleared before derivation — Krux is
+        canonically the sender and never trusts coordinator-supplied SP fields.
+        Do NOT inherit this clearing behaviour if receive-side support is ever
+        added; a future receive module must derive its own logic.
+        """
+        gc.collect()
+        from collections import OrderedDict
+
+        # Discard any incoming SP fields (coordinator-supplied, potentially wrong).
+        self.psbt.sp_ecdh_shares = OrderedDict()
+        self.psbt.sp_dleq_proofs = OrderedDict()
+        for inp in self.psbt.inputs:
+            inp.sp_ecdh_shares = OrderedDict()
+            inp.sp_dleq_proofs = OrderedDict()
+
+        pairs_added = self.psbt._sign_with_sp(  # pylint: disable=protected-access
+            self.wallet.key.root, aux_rand=self._sp_aux_rand()
+        )
+        gc.collect()
+
+        if pairs_added == 0:
+            raise ValueError(
+                "Silent Payment derivation failed: no ECDH shares generated"
+            )
+
     def add_signatures(self):
         """Add signatures to PSBT"""
         sigs_added = self.psbt.sign_with(self.wallet.key.root)
@@ -505,12 +569,23 @@ class PSBTSigner:
 
     def sign(self, trim=True):
         """Signs the PSBT and preserves necessary fields for the final transaction"""
+        if self.has_sp_outputs():
+            # Populate per-input ECDH shares + DLEQ proofs with Krux entropy.
+            # Incoming SP fields are discarded inside _populate_silent_payment_outputs.
+            self._populate_silent_payment_outputs()
+
+            # Re-validate BIP-375 structure after fresh derivation.
+            # skip_output_scripts=True because Krux populates per-input shares only;
+            # the coordinator derives actual P2TR output scripts from those shares.
+            self._validate_silent_payment(skip_output_scripts=True)
+
         self.add_signatures()
 
         if not trim:
             return
 
-        trimmed_psbt = PSBT(self.psbt.tx)
+        # Pass version to preserve PSBTv2 when the source PSBT is v2 (SP).
+        trimmed_psbt = PSBT(self.psbt.tx, version=self.psbt.version)
         for i, inp in enumerate(self.psbt.inputs):
             # Copy the final_scriptwitness if present
             if inp.final_scriptwitness:
@@ -543,6 +618,18 @@ class PSBTSigner:
             # Preserve taproot script path sigs
             if inp.taproot_sigs:
                 trimmed_psbt.inputs[i].taproot_sigs = inp.taproot_sigs
+
+            # Preserve BIP-375 per-input SP ECDH shares and DLEQ proofs.
+            if inp.sp_ecdh_shares:
+                trimmed_psbt.inputs[i].sp_ecdh_shares = inp.sp_ecdh_shares
+            if inp.sp_dleq_proofs:
+                trimmed_psbt.inputs[i].sp_dleq_proofs = inp.sp_dleq_proofs
+
+        # Preserve BIP-375 global SP fields on the trimmed PSBT.
+        if self.psbt.sp_ecdh_shares:
+            trimmed_psbt.sp_ecdh_shares = self.psbt.sp_ecdh_shares
+        if self.psbt.sp_dleq_proofs:
+            trimmed_psbt.sp_dleq_proofs = self.psbt.sp_dleq_proofs
 
         self.psbt = trimmed_psbt
 
