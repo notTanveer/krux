@@ -244,19 +244,39 @@ class Home(Page):
         return (None, FORMAT_NONE, psbt_filename)
 
     def _sign_menu(self, signer, psbt_filename, outputs):
+        # PR 1 gates Silent Payment signing — detection and review are wired up
+        # but the derivation + DLEQ-proof generation paths land in PR 2.
+        sp_unsupported = signer.has_sp_outputs()
+        # Raw English on purpose: PR 3 reintroduces t() with translations once
+        # the SP UI strings settle.
+        sp_unsupported_msg = "Silent Payment signing not yet supported"
+
+        def sp_disabled_action():
+            self.flash_error(sp_unsupported_msg)
+
+        def noop():
+            return None
+
+        if sp_unsupported:
+            sign_qr_cb = sp_disabled_action
+            sign_sd_cb = sp_disabled_action
+        else:
+            sign_qr_cb = noop
+            sign_sd_cb = None if not self.has_sd_card() else noop
         submenu = Menu(
             self.ctx,
             [
                 (t("Review Again"), lambda: None),
-                (t("Sign to QR code"), lambda: None),
-                (
-                    t("Sign to SD card"),
-                    None if not self.has_sd_card() else lambda: None,
-                ),
+                (t("Sign to QR code"), sign_qr_cb),
+                (t("Sign to SD card"), sign_sd_cb),
             ],
             back_status=lambda: None,
         )
         index, _ = submenu.run_loop()
+        # Disabled SP signing returns user to the sign menu rather than falling
+        # through to the signing branches below.
+        while sp_unsupported and index in (1, 2):
+            index, _ = submenu.run_loop()
 
         while index == 0:  # Review PSBT
             self._display_transaction_for_review(outputs)
@@ -411,6 +431,27 @@ class Home(Page):
 
         return True
 
+    def _sp_warn(self):
+        """Warns when SP outputs are present so the user verifies sp1/tsp1 addresses.
+
+        The on-chain destination for an SP output is a derived P2TR that the
+        recipient alone can recognize, so the user must verify the sp1/tsp1
+        address against what the recipient communicated — never the P2TR.
+
+        SP-specific copy below is intentionally raw English; PR 3 reintroduces
+        t() once the SP UI strings settle and translations are produced.
+        """
+        self.ctx.display.clear()
+        self.ctx.display.draw_centered_text(
+            t("Warning:")
+            + " "
+            + "PSBT contains Silent Payment outputs."
+            + "\n\n"
+            + "Verify the sp1/tsp1 address with the recipient.",
+            highlight_prefix=":",
+        )
+        return self.prompt(t("Proceed?"), BOTTOM_PROMPT_LINE)
+
     def _fees_psbt_warn(self, fee_percent):
         """Warn if fees greater than 10% of what is spent"""
         if fee_percent >= 10.0:
@@ -511,6 +552,9 @@ class Home(Page):
         outputs, fee_percent = signer.outputs()
 
         if not self._fees_psbt_warn(fee_percent):
+            return MENU_CONTINUE
+
+        if signer.has_sp_outputs() and not self._sp_warn():
             return MENU_CONTINUE
 
         self._display_transaction_for_review(outputs)
