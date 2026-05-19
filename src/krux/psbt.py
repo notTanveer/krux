@@ -185,6 +185,45 @@ class PSBTSigner:
             if self.wallet.policy != self.policy:
                 raise ValueError("policy mismatch")
 
+        # BIP-375 Silent Payment validation lives in src/krux/silent_payments.py;
+        # only fires when the PSBT actually carries SP outputs, so SP-naive
+        # flows pay zero cost.
+        if self.has_sp_outputs():
+            from .silent_payments import validate_eligibility, validate as sp_validate
+
+            validate_eligibility(self.policy)
+            sp_validate(self.psbt, skip_output_scripts=True)
+
+    def has_sp_outputs(self):
+        """Returns True if any output carries BIP-375 Silent Payment data"""
+        from .silent_payments import has_sp_outputs
+
+        return has_sp_outputs(self.psbt)
+
+    def _silent_payment_address_from_output(self, out):
+        """Delegates to silent_payments.address_from_output."""
+        from .silent_payments import address_from_output
+
+        return address_from_output(out, self.wallet.key.network)
+
+    def _output_address(self, index, out):
+        """Delegates to silent_payments.output_address."""
+        from .silent_payments import output_address
+
+        return output_address(self.psbt, index, out, self.wallet.key.network)
+
+    def _validate_silent_payment(self, skip_output_scripts=True):
+        """Delegates to silent_payments.validate."""
+        from .silent_payments import validate as sp_validate
+
+        sp_validate(self.psbt, skip_output_scripts=skip_output_scripts)
+
+    def _validate_silent_payment_eligibility(self):
+        """Delegates to silent_payments.validate_eligibility."""
+        from .silent_payments import validate_eligibility
+
+        validate_eligibility(self.policy)
+
     def get_policy_from_psbt_input(self, tx_input, xpubs, origin_less_xpub=None):
         """Extracts the scriptPubKey from an input's UTXO and determines the policy."""
         if tx_input.witness_utxo:
@@ -241,6 +280,12 @@ class PSBTSigner:
 
     def _classify_output(self, out_policy, out):
         """Classify the output based on its properties and policy"""
+
+        # Silent Payment outputs go to an external recipient by construction,
+        # so they are always classified as SPEND. This also avoids deriving
+        # change/self-transfer state from an empty script_pubkey.
+        if getattr(out, "sp_data", None) is not None:
+            return SPEND
 
         address_from_my_wallet = False
         address_is_change = False
@@ -356,42 +401,30 @@ class PSBTSigner:
             # Expected to fail to get xpubs from Miniscript PSBT
             pass
         for i, out in enumerate(self.psbt.outputs):
-            out_policy = get_policy(
-                out, self.psbt.tx.vout[i].script_pubkey, xpubs, origin_less_xpub
-            )
-            output_policy_count[out_policy["type"]] += 1
-            output_type = self._classify_output(out_policy, out)
+            is_sp = getattr(out, "sp_data", None) is not None
+            if is_sp:
+                # script_pubkey is empty until the sender derives it; skip the
+                # policy lookup and rely on _classify_output's SP short-circuit.
+                output_type = self._classify_output(None, out)
+            else:
+                out_policy = get_policy(
+                    out, self.psbt.tx.vout[i].script_pubkey, xpubs, origin_less_xpub
+                )
+                output_policy_count[out_policy["type"]] += 1
+                output_type = self._classify_output(out_policy, out)
+
+            address = self._output_address(i, out)
+            value = self.psbt.tx.vout[i].value
 
             if output_type == CHANGE:
-                change_list.append(
-                    (
-                        self.psbt.tx.vout[i].script_pubkey.address(
-                            network=self.wallet.key.network
-                        ),
-                        self.psbt.tx.vout[i].value,
-                    )
-                )
-                change_amount += self.psbt.tx.vout[i].value
+                change_list.append((address, value))
+                change_amount += value
             elif output_type == SELF_TRANSFER:
-                self_transfer_list.append(
-                    (
-                        self.psbt.tx.vout[i].script_pubkey.address(
-                            network=self.wallet.key.network
-                        ),
-                        self.psbt.tx.vout[i].value,
-                    )
-                )
-                self_amount += self.psbt.tx.vout[i].value
+                self_transfer_list.append((address, value))
+                self_amount += value
             else:  # Address is from other wallet
-                spend_list.append(
-                    (
-                        self.psbt.tx.vout[i].script_pubkey.address(
-                            network=self.wallet.key.network
-                        ),
-                        self.psbt.tx.vout[i].value,
-                    )
-                )
-                spend_amount += self.psbt.tx.vout[i].value
+                spend_list.append((address, value))
+                spend_amount += value
 
         if len(spend_list) > 0:
             resume_spend_str = (
