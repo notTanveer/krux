@@ -74,7 +74,7 @@ def validate(psbt, skip_output_scripts=True):
     typically have empty script_pubkeys until the sender derives them. The
     sender re-runs full validation after derivation in PR 2.
     """
-    from embit.bip375_validator import BIP375Validator, SPValidationError
+    from embit.silent_payments import BIP375Validator, SPValidationError
 
     try:
         BIP375Validator(psbt).validate(skip_output_scripts=skip_output_scripts)

@@ -20,7 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 import gc
-from embit.psbt import PSBT, CompressMode
+from embit.psbt import CompressMode
+from embit.silent_payments import SilentPaymentsPSBT as PSBT
 from ur.ur import UR
 from urtypes.crypto.psbt import PSBT as URTYPE_PSBT, CRYPTO_PSBT
 from .baseconv import base_decode
@@ -529,14 +530,13 @@ class PSBTSigner:
         added; a future receive module must derive its own logic.
         """
         gc.collect()
-        from collections import OrderedDict
 
         # Discard any incoming SP fields (coordinator-supplied, potentially wrong).
-        self.psbt.sp_ecdh_shares = OrderedDict()
-        self.psbt.sp_dleq_proofs = OrderedDict()
+        self.psbt.sp_ecdh_shares.clear()
+        self.psbt.sp_dleq_proofs.clear()
         for inp in self.psbt.inputs:
-            inp.sp_ecdh_shares = OrderedDict()
-            inp.sp_dleq_proofs = OrderedDict()
+            inp.sp_ecdh_shares.clear()
+            inp.sp_dleq_proofs.clear()
 
         pairs_added = self.psbt._sign_with_sp(  # pylint: disable=protected-access
             self.wallet.key.root, aux_rand=self._sp_aux_rand()

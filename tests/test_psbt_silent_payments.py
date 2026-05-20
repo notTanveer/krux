@@ -25,8 +25,13 @@ def _build_sp_psbt_bytes():
     sys.path.insert(0, "vendor/embit/src")
     from embit.bip32 import HDKey, parse_path
     from embit.bip39 import mnemonic_to_seed
-    from embit.psbt import PSBT, InputScope, OutputScope, DerivationPath
-    from embit.psbtv2_sp import SilentPaymentData
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
     from embit import ec
     from embit.script import p2wpkh, Script
     from embit.transaction import TransactionOutput
@@ -153,7 +158,7 @@ def test_output_address_uses_script_pubkey_for_non_sp_output(m5stickv):
 
 def test_validate_silent_payment_maps_validator_errors(m5stickv, monkeypatch):
     from krux.psbt import PSBTSigner
-    from embit.bip375_validator import SPValidationError
+    from embit.silent_payments import SPValidationError
 
     signer = _make_signer(PSBTSigner)
     signer.psbt = SimpleNamespace(
@@ -170,7 +175,7 @@ def test_validate_silent_payment_maps_validator_errors(m5stickv, monkeypatch):
         def validate(self, skip_output_scripts=False):
             raise SPValidationError("bad fields")
 
-    monkeypatch.setattr("embit.bip375_validator.BIP375Validator", _BrokenValidator)
+    monkeypatch.setattr("embit.silent_payments.BIP375Validator", _BrokenValidator)
 
     with pytest.raises(
         ValueError, match="Silent Payment validation failed: bad fields"
@@ -298,7 +303,6 @@ def test_sp_signing_adds_dleq_proofs(m5stickv):
 
 def test_sp_signing_discards_incoming_fields(m5stickv):
     """Coordinator-supplied SP fields must be discarded and replaced by Krux-derived ones."""
-    from embit.psbt import PSBT
     from krux.psbt import PSBTSigner
     from krux.qr import FORMAT_NONE
 
@@ -336,7 +340,7 @@ def test_sp_signing_preserves_psbt_version_2(m5stickv):
 
 def test_sp_fields_survive_serialization(m5stickv):
     """SP ECDH shares and DLEQ proofs must survive a serialize → parse round-trip."""
-    from embit.psbt import PSBT
+    from embit.silent_payments import SilentPaymentsPSBT as PSBT
     from krux.psbt import PSBTSigner
     from krux.qr import FORMAT_NONE
 
