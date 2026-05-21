@@ -449,6 +449,209 @@ def test_sp_psbt_v2_absent_script_parseable(m5stickv):
     assert signer.psbt.outputs[0].script_pubkey is None
 
 
+def test_sp_signing_absent_script_full_flow(m5stickv):
+    """Sparrow-style SP PSBT (absent script_pubkey) must sign end-to-end."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sparrow_style_sp_psbt()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+    inp = signer.psbt.inputs[0]
+    assert scan_key_bytes in inp.sp_ecdh_shares
+    has_partial = bool(inp.partial_sigs)
+    has_witness = bool(inp.final_scriptwitness)
+    assert has_partial or has_witness
+
+
+def _build_sp_psbt_with_p2tr_input():
+    """Build PSBTv2 with a P2TR input + SP output (BIP-375 invalid)."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit import ec
+    from embit.script import Script
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    fingerprint = root.child(0).fingerprint
+    child = root.derive("m/86h/1h/0h/0/0")
+    pub = child.get_public_key()
+
+    scan_pub = ec.PublicKey.parse(bytes.fromhex(_SCAN_PUB_HEX))
+    spend_pub = ec.PublicKey.parse(bytes.fromhex(_SPEND_PUB_HEX))
+
+    psbt = PSBT.create_v2()
+
+    inp = InputScope()
+    inp.txid = bytes(32)
+    inp.vout = 0
+    inp.sequence = 0xFFFFFFFE
+    # P2TR witness UTXO
+    inp.witness_utxo = TransactionOutput(
+        value=100_000, script_pubkey=Script(b"\x51\x20" + pub.xonly())
+    )
+    inp.taproot_bip32_derivations[pub] = (
+        [],
+        DerivationPath(fingerprint, parse_path("m/86h/1h/0h/0/0")),
+    )
+    psbt.add_input(inp)
+
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = None
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    return psbt.serialize()
+
+
+def test_sp_signing_no_eligible_inputs_error(m5stickv):
+    """P2TR-only inputs with SP outputs must produce a descriptive error at load time."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_with_p2tr_input()
+
+    with pytest.raises(ValueError, match="P2PKH, P2WPKH, or P2SH-P2WPKH"):
+        PSBTSigner(wallet, raw, FORMAT_NONE)
+
+
+def _build_sp_psbt_wrong_fingerprint():
+    """Build PSBTv2 with bip32_derivation fingerprint that doesn't match wallet."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit import ec
+    from embit.script import p2wpkh, Script
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    child = root.derive("m/84h/1h/0h/0/0")
+    pub = child.get_public_key()
+
+    scan_pub = ec.PublicKey.parse(bytes.fromhex(_SCAN_PUB_HEX))
+    spend_pub = ec.PublicKey.parse(bytes.fromhex(_SPEND_PUB_HEX))
+
+    psbt = PSBT.create_v2()
+
+    inp = InputScope()
+    inp.txid = bytes(32)
+    inp.vout = 0
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2wpkh(pub))
+    wrong_fp = b"\xde\xad\xbe\xef"
+    inp.bip32_derivations[pub] = DerivationPath(
+        wrong_fp, parse_path("m/84h/1h/0h/0/0")
+    )
+    psbt.add_input(inp)
+
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = Script(b"\x51\x20" + bytes(32))
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    return psbt.serialize()
+
+
+def test_sp_signing_fingerprint_mismatch_error(m5stickv):
+    """Wrong fingerprint in bip32_derivation must produce a descriptive error."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_wrong_fingerprint()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        signer.sign()
+
+
+def _build_sp_psbt_no_derivations():
+    """Build PSBTv2 with P2WPKH input but no bip32_derivations."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey
+    from embit.bip39 import mnemonic_to_seed
+    from embit.silent_payments import (
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit import ec
+    from embit.script import p2wpkh, Script
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    child = root.derive("m/84h/1h/0h/0/0")
+    pub = child.get_public_key()
+
+    scan_pub = ec.PublicKey.parse(bytes.fromhex(_SCAN_PUB_HEX))
+    spend_pub = ec.PublicKey.parse(bytes.fromhex(_SPEND_PUB_HEX))
+
+    psbt = PSBT.create_v2()
+
+    inp = InputScope()
+    inp.txid = bytes(32)
+    inp.vout = 0
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2wpkh(pub))
+    # Deliberately omit bip32_derivations
+    psbt.add_input(inp)
+
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = Script(b"\x51\x20" + bytes(32))
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    return psbt.serialize()
+
+
+def test_sp_signing_no_derivations_error(m5stickv):
+    """Missing bip32_derivations on eligible input must produce a descriptive error."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_no_derivations()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+
+    with pytest.raises(ValueError, match="no BIP-32 derivations"):
+        signer.sign()
+
+
 def test_psbt_error_message_propagates_details(m5stickv):
     """ValueError raised by PSBTSigner must include the original error details."""
     from krux.psbt import PSBTSigner

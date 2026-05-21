@@ -538,6 +538,8 @@ class PSBTSigner:
             inp.sp_ecdh_shares.clear()
             inp.sp_dleq_proofs.clear()
 
+        self._validate_sp_signing_inputs()
+
         pairs_added = self.psbt._sign_with_sp(  # pylint: disable=protected-access
             self.wallet.key.root, aux_rand=self._sp_aux_rand()
         )
@@ -547,6 +549,113 @@ class PSBTSigner:
             raise ValueError(
                 "Silent Payment derivation failed: no ECDH shares generated"
             )
+
+    def _validate_sp_signing_inputs(self):
+        """Pre-check that inputs satisfy SP signing requirements.
+
+        _sign_with_sp has several silent-return-0 paths.  Running the same
+        checks here turns each into a descriptive ValueError so the user
+        (and developers) can see exactly what went wrong.
+        """
+        from embit.silent_payments.ecdh import get_eligible_inputs
+        from embit.silent_payments.fields import SPValidationError
+
+        try:
+            eligible = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
+        except SPValidationError as e:
+            raise ValueError("Silent Payment signing failed: %s" % e)
+
+        if not eligible:
+            types = []
+            for i, inp in enumerate(self.psbt.inputs):
+                sp = inp.script_pubkey
+                if sp is None:
+                    types.append("input %d: no UTXO" % i)
+                else:
+                    types.append("input %d: %s" % (i, sp.script_type()))
+            raise ValueError(
+                "Silent Payment signing failed: no eligible inputs. %s"
+                % "; ".join(types)
+            )
+
+        fingerprint = self.wallet.key.root.my_fingerprint
+        for i in eligible:
+            inp = self.psbt.inputs[i]
+            if not inp.bip32_derivations:
+                raise ValueError(
+                    "Silent Payment signing failed: input %d has no BIP-32 derivations"
+                    % i
+                )
+            fps = [d.fingerprint.hex() for d in inp.bip32_derivations.values()]
+            if not any(
+                d.fingerprint == fingerprint
+                for d in inp.bip32_derivations.values()
+            ):
+                raise ValueError(
+                    "Silent Payment signing failed: input %d fingerprint mismatch "
+                    "(wallet: %s, PSBT: %s)" % (i, fingerprint.hex(), ", ".join(fps))
+                )
+
+    def _derive_sp_output_scripts(self):
+        """Derive P2TR scripts for SP outputs that have script_pubkey=None.
+
+        After ECDH shares are populated, combine per-input shares into a
+        global share per scan key, then run BIP-352 output derivation.
+        Outputs that already have a script_pubkey are left untouched.
+        """
+        from embit.silent_payments.ecdh import get_eligible_inputs
+        from embit.silent_payments.outputs import (
+            derive_silent_payment_outputs,
+            _combine_shares,
+        )
+        from embit import ec
+        from embit.script import p2tr
+
+        eligible = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
+
+        scan_groups = {}
+        for i, out in enumerate(self.psbt.outputs):
+            if out.sp_data is not None and out.script_pubkey is None:
+                sk_bytes = out.sp_data.scan_key.sec()
+                scan_groups.setdefault(sk_bytes, []).append((i, out))
+
+        if not scan_groups:
+            return
+
+        for sk_bytes, outputs in scan_groups.items():
+            shares = []
+            for i in eligible:
+                share = self.psbt.inputs[i].sp_ecdh_shares.get(sk_bytes)
+                if share is not None:
+                    shares.append(share)
+
+            if not shares:
+                continue
+
+            global_share = _combine_shares(shares)
+
+            sorted_outputs = sorted(
+                outputs, key=lambda x: x[1].sp_data.spend_key.sec()
+            )
+
+            recipients = [
+                (
+                    out.sp_data.scan_key,
+                    out.sp_data.spend_key,
+                    getattr(out, "sp_label", None),
+                )
+                for _, out in sorted_outputs
+            ]
+
+            derived = derive_silent_payment_outputs(
+                global_share, recipients, shared_secret=global_share[1:33]
+            )
+
+            for pos, (_, out) in enumerate(sorted_outputs):
+                if pos in derived:
+                    out.script_pubkey = p2tr(ec.PublicKey.from_xonly(derived[pos]))
+
+        gc.collect()
 
     def add_signatures(self):
         """Add signatures to PSBT"""
@@ -595,9 +704,12 @@ class PSBTSigner:
             # Incoming SP fields are discarded inside _populate_silent_payment_outputs.
             self._populate_silent_payment_outputs()
 
-            # Re-validate BIP-375 structure after fresh derivation.
-            # skip_output_scripts=True because Krux populates per-input shares only;
-            # the coordinator derives actual P2TR output scripts from those shares.
+            # Derive P2TR output scripts for SP outputs that are still empty.
+            # Sparrow (and other coordinators) omit PSBT_OUT_SCRIPT for SP
+            # outputs per BIP-375; the signer must derive them from the ECDH
+            # shares before sighash computation.
+            self._derive_sp_output_scripts()
+
             self._validate_silent_payment(skip_output_scripts=True)
 
         self.add_signatures()
