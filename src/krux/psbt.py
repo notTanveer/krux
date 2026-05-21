@@ -710,7 +710,7 @@ class PSBTSigner:
             # shares before sighash computation.
             self._derive_sp_output_scripts()
 
-            self._validate_silent_payment(skip_output_scripts=True)
+            self._validate_silent_payment(skip_output_scripts=False)
 
         self.add_signatures()
 
@@ -764,7 +764,23 @@ class PSBTSigner:
         if self.psbt.sp_dleq_proofs:
             trimmed_psbt.sp_dleq_proofs = self.psbt.sp_dleq_proofs
 
+        # Preserve BIP-375 per-output SP metadata.  PSBT(self.psbt.tx, …) constructs
+        # fresh SPOutputScopes with sp_data=None / sp_label=None; without this loop the
+        # exported PSBT omits PSBT_OUT_SP_V0_INFO (0x09) and Sparrow cannot tie the
+        # derived P2TR back to the SP recipient address it originally specified.
+        for i, out in enumerate(self.psbt.outputs):
+            if out.sp_data is not None:
+                trimmed_psbt.outputs[i].sp_data = out.sp_data
+            if out.sp_label is not None:
+                trimmed_psbt.outputs[i].sp_label = out.sp_label
+
+        # Per BIP-375, once SP output scripts are set the tx must be non-modifiable.
+        trimmed_psbt.tx_modifiable_flags = 0
+
         self.psbt = trimmed_psbt
+
+        if self.has_sp_outputs():
+            self._validate_silent_payment(skip_output_scripts=False)
 
     def psbt_qr(self):
         """Returns the psbt in the same form it was read as a QR code"""

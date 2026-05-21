@@ -33,7 +33,7 @@ def _build_sp_psbt_bytes():
         SPOutputScope as OutputScope,
     )
     from embit import ec
-    from embit.script import p2wpkh, Script
+    from embit.script import p2wpkh
     from embit.transaction import TransactionOutput
 
     seed = mnemonic_to_seed(TEST_MNEMONIC)
@@ -59,7 +59,7 @@ def _build_sp_psbt_bytes():
 
     out = OutputScope()
     out.value = 99_000
-    out.script_pubkey = Script(b"\x51\x20" + bytes(32))  # placeholder P2TR
+    out.script_pubkey = None  # script absent — signer derives it (real coordinator behaviour)
     out.sp_data = SilentPaymentData(scan_pub, spend_pub)
     psbt.add_output(out)
     psbt.tx_modifiable_flags = 0
@@ -659,3 +659,53 @@ def test_psbt_error_message_propagates_details(m5stickv):
 
     with pytest.raises(ValueError, match="invalid PSBT:"):
         PSBTSigner(_make_sp_wallet(), b"not a psbt", FORMAT_NONE)
+
+
+def test_sp_signing_signed_psbt_roundtrip_preserves_metadata(m5stickv):
+    """Signed+trimmed PSBT must preserve sp_data so Sparrow can finalize.
+
+    Regression for: trim rebuilt fresh SPOutputScopes with sp_data=None,
+    causing Sparrow to silently reject the PSBT (it couldn't match the
+    derived P2TR script back to the SP recipient address).
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.silent_payments import SilentPaymentsPSBT as PSBT, BIP375Validator
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sparrow_style_sp_psbt()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign(trim=True)
+
+    # Materialise the QR bytes without destroying signer.psbt (psbt_qr sets it to None)
+    exported_bytes = signer.psbt.serialize()
+
+    reparsed = PSBT.parse(exported_bytes)
+
+    # sp_data must survive the trim so Sparrow can validate the SP output.
+    assert reparsed.outputs[0].sp_data is not None
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+    spend_key_bytes = bytes.fromhex(_SPEND_PUB_HEX)
+    assert reparsed.outputs[0].sp_data.scan_key.sec() == scan_key_bytes
+    assert reparsed.outputs[0].sp_data.spend_key.sec() == spend_key_bytes
+
+    # The derived P2TR script must be present and valid (34-byte OP_1 <32-byte xonly>).
+    script = reparsed.outputs[0].script_pubkey
+    assert script is not None
+    raw_script = script.data
+    assert len(raw_script) == 34
+    assert raw_script[0] == 0x51 and raw_script[1] == 0x20
+
+    # Per-input ECDH share and DLEQ proof must be present.
+    inp = reparsed.inputs[0]
+    assert scan_key_bytes in inp.sp_ecdh_shares
+    assert scan_key_bytes in inp.sp_dleq_proofs
+
+    # tx_modifiable_flags must be 0 (BIP-375 non-modifiable).
+    assert reparsed.tx_modifiable_flags == 0
+
+    # Stage-4 BIP-375 validation must pass — this is what Sparrow effectively runs.
+    BIP375Validator(reparsed).validate(skip_output_scripts=False)
