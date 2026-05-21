@@ -373,3 +373,86 @@ def test_sp_signing_also_signs_input(m5stickv):
     has_partial = bool(inp.partial_sigs)
     has_witness = bool(inp.final_scriptwitness)
     assert has_partial or has_witness, "Input must be signed after sign()"
+
+
+def _build_sparrow_style_sp_psbt():
+    """Build PSBTv2 bytes mimicking Sparrow: SP output OMITS PSBT_OUT_SCRIPT.
+
+    BIP-375 says the signer derives the P2TR output script after ECDH.
+    Sparrow as the coordinator omits PSBT_OUT_SCRIPT for the SP output,
+    leaving it for the signing device to fill.
+    """
+    import sys
+    from io import BytesIO
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.psbt import DerivationPath, ser_string
+    from embit.silent_payments import (
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit import ec
+    from embit.script import p2wpkh, Script
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    fingerprint = root.child(0).fingerprint
+    child = root.derive("m/84h/1h/0h/0/0")
+    pub = child.get_public_key()
+
+    scan_pub = ec.PublicKey.parse(bytes.fromhex(_SCAN_PUB_HEX))
+    spend_pub = ec.PublicKey.parse(bytes.fromhex(_SPEND_PUB_HEX))
+
+    psbt = PSBT.create_v2()
+
+    inp = InputScope()
+    inp.txid = bytes(32)
+    inp.vout = 0
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=p2wpkh(pub))
+    inp.bip32_derivations[pub] = DerivationPath(
+        fingerprint, parse_path("m/84h/1h/0h/0/0")
+    )
+    psbt.add_input(inp)
+
+    # SP output: has sp_data but NO script_pubkey (Sparrow omits PSBT_OUT_SCRIPT)
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = None  # deliberately absent
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    return psbt.serialize()
+
+
+def test_sp_psbt_v2_absent_script_parseable(m5stickv):
+    """PSBTv2 with SP output that omits PSBT_OUT_SCRIPT must parse successfully.
+
+    This tests interoperability with coordinators (like Sparrow) that omit
+    PSBT_OUT_SCRIPT for SP outputs, expecting the signer to derive it.
+    """
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sparrow_style_sp_psbt()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+
+    assert signer.psbt.version == 2
+    assert signer.psbt.outputs[0].sp_data is not None
+    assert signer.psbt.outputs[0].script_pubkey is None
+
+
+def test_psbt_error_message_propagates_details(m5stickv):
+    """ValueError raised by PSBTSigner must include the original error details."""
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    with pytest.raises(ValueError, match="invalid PSBT:"):
+        PSBTSigner(_make_sp_wallet(), b"not a psbt", FORMAT_NONE)

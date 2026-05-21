@@ -71,7 +71,7 @@ class PSBTSigner:
                 with open(file_path, "rb") as file:
                     self.psbt = PSBT.read_from(file)
                 self.validate()
-            except:
+            except Exception:
                 try:
                     self.policy = None  # Reset policy
                     self.is_b64_file = self.file_is_base64_encoded(file_path)
@@ -96,8 +96,8 @@ class PSBTSigner:
                 self.psbt = PSBT.parse(URTYPE_PSBT.from_cbor(psbt_data.cbor).data)
                 self.ur_type = CRYPTO_PSBT
                 # self.base_encoding = 64
-            except:
-                raise ValueError("invalid PSBT")
+            except Exception as e:
+                raise ValueError("invalid PSBT: %s" % e)
         else:
             try:
                 self.psbt = PSBT.parse(psbt_data)
@@ -105,22 +105,22 @@ class PSBTSigner:
                     # We can't return the PSBT as a multi-part sequence of bytes, so convert to
                     # base64 first
                     self.base_encoding = 64
-            except:
+            except Exception:
                 try:
                     self.psbt = PSBT.parse(base_decode(psbt_data, 64))
                     self.base_encoding = 64
-                except:
+                except Exception:
                     try:
                         self.psbt = PSBT.parse(base_decode(psbt_data, 58))
                         self.base_encoding = 58
-                    except:
+                    except Exception:
                         try:
                             import base43
 
                             self.psbt = PSBT.parse(base43.decode(psbt_data))
                             self.base_encoding = 43
-                        except:
-                            raise ValueError("invalid PSBT")
+                        except Exception as e:
+                            raise ValueError("invalid PSBT: %s" % e)
         if self.policy is None:
             # If not yet validated (e.g. from file and compressed), validate now
             try:
