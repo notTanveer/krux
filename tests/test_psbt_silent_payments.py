@@ -704,8 +704,289 @@ def test_sp_signing_signed_psbt_roundtrip_preserves_metadata(m5stickv):
     assert scan_key_bytes in inp.sp_ecdh_shares
     assert scan_key_bytes in inp.sp_dleq_proofs
 
+    # Global ECDH share + DLEQ proof must also be present and correctly sized.
+    # Sparrow's post-finalization validator uses global fields (path 1) and skips
+    # per-input checks — these fields survive input finalization/metadata clearing.
+    assert scan_key_bytes in reparsed.sp_ecdh_shares, (
+        "PSBT_GLOBAL_SP_ECDH_SHARE missing — Sparrow will reject at broadcast"
+    )
+    assert len(reparsed.sp_ecdh_shares[scan_key_bytes]) == 33
+    assert scan_key_bytes in reparsed.sp_dleq_proofs, (
+        "PSBT_GLOBAL_SP_DLEQ missing — Sparrow will reject at broadcast"
+    )
+    assert len(reparsed.sp_dleq_proofs[scan_key_bytes]) == 64
+
     # tx_modifiable_flags must be 0 (BIP-375 non-modifiable).
     assert reparsed.tx_modifiable_flags == 0
 
     # Stage-4 BIP-375 validation must pass — this is what Sparrow effectively runs.
+    BIP375Validator(reparsed).validate(skip_output_scripts=False)
+
+
+def _build_sp_psbt_two_inputs():
+    """PSBTv2 with TWO P2WPKH inputs and one SP output (no script_pubkey).
+
+    Input 0: m/84h/1h/0h/0/0, Input 1: m/84h/1h/0h/0/1 — both from the
+    standard mnemonic.  Both are eligible and must carry SP fields after sign().
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit import ec
+    from embit.script import p2wpkh
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    fingerprint = root.child(0).fingerprint
+
+    child0 = root.derive("m/84h/1h/0h/0/0")
+    pub0 = child0.get_public_key()
+    child1 = root.derive("m/84h/1h/0h/0/1")
+    pub1 = child1.get_public_key()
+
+    scan_pub = ec.PublicKey.parse(bytes.fromhex(_SCAN_PUB_HEX))
+    spend_pub = ec.PublicKey.parse(bytes.fromhex(_SPEND_PUB_HEX))
+
+    psbt = PSBT.create_v2()
+
+    inp0 = InputScope()
+    inp0.txid = bytes(32)
+    inp0.vout = 0
+    inp0.sequence = 0xFFFFFFFE
+    inp0.witness_utxo = TransactionOutput(value=60_000, script_pubkey=p2wpkh(pub0))
+    inp0.bip32_derivations[pub0] = DerivationPath(
+        fingerprint, parse_path("m/84h/1h/0h/0/0")
+    )
+    psbt.add_input(inp0)
+
+    inp1 = InputScope()
+    inp1.txid = bytes(31) + b"\x01"
+    inp1.vout = 0
+    inp1.sequence = 0xFFFFFFFE
+    inp1.witness_utxo = TransactionOutput(value=60_000, script_pubkey=p2wpkh(pub1))
+    inp1.bip32_derivations[pub1] = DerivationPath(
+        fingerprint, parse_path("m/84h/1h/0h/0/1")
+    )
+    psbt.add_input(inp1)
+
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = None
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    return psbt.serialize()
+
+
+def test_sp_signing_two_inputs_both_eligible_have_sp_fields(m5stickv):
+    """Both P2WPKH inputs must carry ECDH share + DLEQ proof after sign().
+
+    Regression for the Sparrow broadcast failure where Krux only populated
+    SP fields for one of two inputs, triggering BIP-375 validator rejection.
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.silent_payments import SilentPaymentsPSBT as PSBT, BIP375Validator
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_two_inputs()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign(trim=True)
+
+    exported_bytes = signer.psbt.serialize()
+    reparsed = PSBT.parse(exported_bytes)
+
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+
+    for idx in (0, 1):
+        inp = reparsed.inputs[idx]
+        assert scan_key_bytes in inp.sp_ecdh_shares, (
+            "input %d missing PSBT_IN_SP_ECDH_SHARE" % idx
+        )
+        assert scan_key_bytes in inp.sp_dleq_proofs, (
+            "input %d missing PSBT_IN_SP_DLEQ" % idx
+        )
+        assert len(inp.sp_ecdh_shares[scan_key_bytes]) == 33
+        assert len(inp.sp_dleq_proofs[scan_key_bytes]) == 64
+
+    # Stage-4 BIP-375 validation must pass.
+    BIP375Validator(reparsed).validate(skip_output_scripts=False)
+
+
+def _build_sp_psbt_xonly_mismatch():
+    """PSBTv2 with two P2WPKH inputs where input 0 has an xonly mismatch.
+
+    Input 0's bip32_derivations maps the pubkey from /0/1 to the path /0/0.
+    The fingerprint matches (so pre-validation passes) but _sign_with_sp will
+    silently skip input 0 because root.derive(/0/0).xonly() != pub_0/1.xonly().
+    Input 1 is correct.  This exercises Change 1's post-sign assertion.
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit import ec
+    from embit.script import p2wpkh
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    fingerprint = root.child(0).fingerprint
+
+    pub0 = root.derive("m/84h/1h/0h/0/0").get_public_key()
+    pub1 = root.derive("m/84h/1h/0h/0/1").get_public_key()
+
+    scan_pub = ec.PublicKey.parse(bytes.fromhex(_SCAN_PUB_HEX))
+    spend_pub = ec.PublicKey.parse(bytes.fromhex(_SPEND_PUB_HEX))
+
+    psbt = PSBT.create_v2()
+
+    # Input 0: UTXO is p2wpkh(pub0) but bip32_derivations maps pub1 → path /0/0.
+    # Fingerprint matches, but xonly(root.derive(/0/0)) == xonly(pub0) != xonly(pub1).
+    inp0 = InputScope()
+    inp0.txid = bytes(32)
+    inp0.vout = 0
+    inp0.sequence = 0xFFFFFFFE
+    inp0.witness_utxo = TransactionOutput(value=60_000, script_pubkey=p2wpkh(pub0))
+    inp0.bip32_derivations[pub1] = DerivationPath(
+        fingerprint, parse_path("m/84h/1h/0h/0/0")
+    )
+    psbt.add_input(inp0)
+
+    # Input 1: correct.
+    inp1 = InputScope()
+    inp1.txid = bytes(31) + b"\x01"
+    inp1.vout = 0
+    inp1.sequence = 0xFFFFFFFE
+    inp1.witness_utxo = TransactionOutput(value=60_000, script_pubkey=p2wpkh(pub1))
+    inp1.bip32_derivations[pub1] = DerivationPath(
+        fingerprint, parse_path("m/84h/1h/0h/0/1")
+    )
+    psbt.add_input(inp1)
+
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = None
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    return psbt.serialize()
+
+
+def test_sp_signing_raises_when_eligible_input_lacks_derivation(m5stickv):
+    """Change 1 post-sign assertion fires when _sign_with_sp silently skips input 0.
+
+    Input 0 passes pre-validation (fingerprint matches) but its bip32_derivations
+    contains an xonly mismatch so _sign_with_sp skips it.  Input 1 is signed
+    (pairs_added > 0).  Krux must detect the gap and raise before exporting QR.
+    """
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_xonly_mismatch()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+
+    with pytest.raises(ValueError, match="input 0 is eligible but is missing"):
+        signer.sign()
+
+
+def test_sp_signing_global_shares_present_after_roundtrip(m5stickv):
+    """Global ECDH share + DLEQ proof must survive sign → serialize → parse.
+
+    Regression test for the Sparrow broadcast-rejection bug: Sparrow's
+    post-finalization validator checks PSBT_GLOBAL_SP_ECDH_SHARE (0x07) and
+    PSBT_GLOBAL_SP_DLEQ (0x08) first (path 1) and skips per-input checks
+    entirely when they're present.  Per-input fields are stripped by Sparrow's
+    finalization step, so only global fields survive to broadcast time.
+
+    Uses two P2WPKH inputs to exercise the multi-input global share sum path.
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.silent_payments import SilentPaymentsPSBT as PSBT, BIP375Validator
+    from embit.silent_payments.dleq import verify_dleq_proof
+    from embit.util.secp256k1 import (
+        ec_pubkey_combine,
+        ec_pubkey_parse,
+        ec_pubkey_serialize,
+        EC_COMPRESSED,
+    )
+    from embit.hashes import hash160
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_two_inputs()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign(trim=True)
+
+    exported_bytes = signer.psbt.serialize()
+    reparsed = PSBT.parse(exported_bytes)
+
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+
+    # Global ECDH share must be present and correctly sized.
+    assert scan_key_bytes in reparsed.sp_ecdh_shares, (
+        "PSBT_GLOBAL_SP_ECDH_SHARE missing after roundtrip"
+    )
+    global_share = reparsed.sp_ecdh_shares[scan_key_bytes]
+    assert len(global_share) == 33, "Global ECDH share must be 33 bytes (compressed point)"
+
+    # Global DLEQ proof must be present and correctly sized.
+    assert scan_key_bytes in reparsed.sp_dleq_proofs, (
+        "PSBT_GLOBAL_SP_DLEQ missing after roundtrip"
+    )
+    global_proof = reparsed.sp_dleq_proofs[scan_key_bytes]
+    assert len(global_proof) == 64, "Global DLEQ proof must be 64 bytes"
+
+    # Verify the global DLEQ proof directly.
+    # Reconstruct A_sum = sum of eligible input public keys (from partial_sigs,
+    # since bip32_derivations are stripped by trim).
+    eligible_pubkeys = []
+    for inp in reparsed.inputs:
+        script = inp.script_pubkey
+        if script is None or script.script_type() != "p2wpkh":
+            continue
+        pkh = bytes(script.data[2:22])
+        for pubkey in inp.partial_sigs:
+            if hash160(pubkey.sec()) == pkh:
+                eligible_pubkeys.append(pubkey)
+                break
+
+    assert len(eligible_pubkeys) == 2, "Both inputs must contribute a public key"
+
+    pub_handles = [ec_pubkey_parse(pk.sec()) for pk in eligible_pubkeys]
+    a_sum_handle = ec_pubkey_combine(pub_handles[0], pub_handles[1])
+    a_sum_sec = ec_pubkey_serialize(a_sum_handle, EC_COMPRESSED)
+
+    assert verify_dleq_proof(
+        a_sum_sec, scan_key_bytes, global_share, global_proof
+    ), "Global DLEQ proof verification failed"
+
+    # Full BIP-375 stage-4 validation must pass — mirrors what Sparrow runs.
     BIP375Validator(reparsed).validate(skip_output_scripts=False)

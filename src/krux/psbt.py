@@ -550,6 +550,75 @@ class PSBTSigner:
                 "Silent Payment derivation failed: no ECDH shares generated"
             )
 
+        # Change 1: strict post-sign assertion — every eligible input must have
+        # per-input SP fields.  _sign_with_sp silently skips inputs whose
+        # derivation matching fails; catch that here before the QR is rendered.
+        from embit.silent_payments.ecdh import (  # pylint: disable=import-outside-toplevel
+            get_eligible_inputs,
+        )
+
+        eligible = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
+        scan_keys_bytes = {
+            out.sp_data.scan_key.sec()
+            for out in self.psbt.outputs
+            if out.sp_data is not None
+        }
+        for i in eligible:
+            inp = self.psbt.inputs[i]
+            missing_share = [sk for sk in scan_keys_bytes if sk not in inp.sp_ecdh_shares]
+            missing_proof = [sk for sk in scan_keys_bytes if sk not in inp.sp_dleq_proofs]
+            if missing_share or missing_proof:
+                raise ValueError(
+                    "Silent Payment signing failed: input %d is eligible but is "
+                    "missing PSBT_IN_SP_ECDH_SHARE/PSBT_IN_SP_DLEQ for one or more "
+                    "scan keys (share missing: %d, proof missing: %d). This usually "
+                    "indicates the BIP-32 derivation for input %d does not derive "
+                    "to the public key the PSBT claims." % (
+                        i, len(missing_share), len(missing_proof), i,
+                    )
+                )
+
+        # Populate PSBT-global ECDH shares + DLEQ proofs.
+        # Sparrow's post-finalization validator checks global fields first (path 1)
+        # and skips per-input checks entirely when they're present.  Global fields
+        # live in the PSBT global map and survive Sparrow's per-input finalization.
+        from embit.silent_payments.ecdh import (  # pylint: disable=import-outside-toplevel
+            compute_global_ecdh_share,
+            compute_global_dleq_proof,
+        )
+
+        root = self.wallet.key.root
+        fingerprint = root.my_fingerprint
+        priv_keys = []
+        for i in eligible:
+            inp = self.psbt.inputs[i]
+            for pub, derivation in inp.bip32_derivations.items():
+                if derivation.fingerprint != fingerprint:
+                    continue
+                hdkey = root.derive(derivation.derivation)
+                if hdkey.xonly() != pub.xonly():
+                    continue
+                priv_keys.append(hdkey.key.secret)
+                break
+
+        if priv_keys:
+            scan_key_objects = {
+                out.sp_data.scan_key.sec(): out.sp_data.scan_key
+                for out in self.psbt.outputs
+                if out.sp_data is not None
+            }
+            global_aux = self._sp_aux_rand()
+            for sk_bytes, scan_key in scan_key_objects.items():
+                global_share = compute_global_ecdh_share(priv_keys, scan_key)
+                if global_share is not None:
+                    global_proof = compute_global_dleq_proof(
+                        priv_keys, scan_key, global_share, aux_rand=global_aux
+                    )
+                    self.psbt.sp_ecdh_shares[sk_bytes] = global_share
+                    self.psbt.sp_dleq_proofs[sk_bytes] = global_proof
+
+        gc.collect()
+
     def _validate_sp_signing_inputs(self):
         """Pre-check that inputs satisfy SP signing requirements.
 
@@ -753,16 +822,16 @@ class PSBTSigner:
                 trimmed_psbt.inputs[i].taproot_sigs = inp.taproot_sigs
 
             # Preserve BIP-375 per-input SP ECDH shares and DLEQ proofs.
-            if inp.sp_ecdh_shares:
-                trimmed_psbt.inputs[i].sp_ecdh_shares = inp.sp_ecdh_shares
-            if inp.sp_dleq_proofs:
-                trimmed_psbt.inputs[i].sp_dleq_proofs = inp.sp_dleq_proofs
+            # Assign unconditionally: an empty OrderedDict is falsy but valid;
+            # the truthiness guard silently drops fields from non-eligible inputs
+            # and masks partial-population bugs.  write_to only emits fields when
+            # the dict has entries so assigning empty is a no-op on the wire.
+            trimmed_psbt.inputs[i].sp_ecdh_shares = inp.sp_ecdh_shares
+            trimmed_psbt.inputs[i].sp_dleq_proofs = inp.sp_dleq_proofs
 
-        # Preserve BIP-375 global SP fields on the trimmed PSBT.
-        if self.psbt.sp_ecdh_shares:
-            trimmed_psbt.sp_ecdh_shares = self.psbt.sp_ecdh_shares
-        if self.psbt.sp_dleq_proofs:
-            trimmed_psbt.sp_dleq_proofs = self.psbt.sp_dleq_proofs
+        # Preserve BIP-375 global SP fields on the trimmed PSBT (unconditional).
+        trimmed_psbt.sp_ecdh_shares = self.psbt.sp_ecdh_shares
+        trimmed_psbt.sp_dleq_proofs = self.psbt.sp_dleq_proofs
 
         # Preserve BIP-375 per-output SP metadata.  PSBT(self.psbt.tx, …) constructs
         # fresh SPOutputScopes with sp_data=None / sp_label=None; without this loop the
