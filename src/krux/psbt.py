@@ -669,16 +669,27 @@ class PSBTSigner:
         """Derive P2TR scripts for SP outputs that have script_pubkey=None.
 
         After ECDH shares are populated, combine per-input shares into a
-        global share per scan key, then run BIP-352 output derivation.
-        Outputs that already have a script_pubkey are left untouched.
+        global share per scan key, apply the BIP-352 input_hash tweak, then
+        run output derivation.  Outputs that already have a script_pubkey are
+        left untouched.
         """
         from embit.silent_payments.ecdh import get_eligible_inputs
         from embit.silent_payments.outputs import (
             derive_silent_payment_outputs,
             _combine_shares,
         )
+        from embit.silent_payments.bip352 import get_input_hash
+        from embit.transaction import COutPoint
+        from embit.hashes import hash160
         from embit import ec
         from embit.script import p2tr
+        from embit.util.secp256k1 import (
+            ec_pubkey_combine,
+            ec_pubkey_parse,
+            ec_pubkey_serialize,
+            ec_pubkey_tweak_mul,
+            EC_COMPRESSED,
+        )
 
         eligible = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
 
@@ -691,6 +702,53 @@ class PSBTSigner:
         if not scan_groups:
             return
 
+        # Build outpoints and sum signing pubkeys to compute input_hash once.
+        outpoints = [
+            COutPoint(txid=self.psbt.tx.vin[i].txid, out_idx=self.psbt.tx.vin[i].vout)
+            for i in eligible
+        ]
+        pubkeys = []
+        for i in eligible:
+            inp = self.psbt.inputs[i]
+            script = inp.script_pubkey
+            if script is None:
+                continue
+            st = script.script_type()
+            if st == "p2wpkh":
+                pkh = bytes(script.data[2:22])
+            elif st == "p2pkh":
+                pkh = bytes(script.data[3:23])
+            elif (
+                st == "p2sh"
+                and inp.redeem_script
+                and inp.redeem_script.script_type() == "p2wpkh"
+            ):
+                pkh = bytes(inp.redeem_script.data[2:22])
+            else:
+                continue
+            for pub in inp.bip32_derivations:
+                if hash160(pub.sec()) == pkh:
+                    pubkeys.append(pub)
+                    break
+            else:
+                for pub in inp.partial_sigs:
+                    if hash160(pub.sec()) == pkh:
+                        pubkeys.append(pub)
+                        break
+
+        if not pubkeys:
+            gc.collect()
+            return
+
+        if len(pubkeys) == 1:
+            A_sum_handle = ec_pubkey_parse(pubkeys[0].sec())
+        else:
+            A_sum_handle = ec_pubkey_parse(pubkeys[0].sec())
+            for pub in pubkeys[1:]:
+                A_sum_handle = ec_pubkey_combine(A_sum_handle, ec_pubkey_parse(pub.sec()))
+        A_sum_bytes = ec_pubkey_serialize(A_sum_handle, EC_COMPRESSED)
+        input_hash = get_input_hash(outpoints, A_sum_bytes)
+
         for sk_bytes, outputs in scan_groups.items():
             shares = []
             for i in eligible:
@@ -702,6 +760,11 @@ class PSBTSigner:
                 continue
 
             global_share = _combine_shares(shares)
+
+            # Apply input_hash: adjusted = input_hash · global_share (BIP-352)
+            adjusted_handle = ec_pubkey_parse(global_share)
+            ec_pubkey_tweak_mul(adjusted_handle, input_hash)
+            adjusted_share = ec_pubkey_serialize(adjusted_handle, EC_COMPRESSED)
 
             sorted_outputs = sorted(
                 outputs, key=lambda x: x[1].sp_data.spend_key.sec()
@@ -716,9 +779,7 @@ class PSBTSigner:
                 for _, out in sorted_outputs
             ]
 
-            derived = derive_silent_payment_outputs(
-                global_share, recipients, shared_secret=global_share[1:33]
-            )
+            derived = derive_silent_payment_outputs(adjusted_share, recipients)
 
             for pos, (_, out) in enumerate(sorted_outputs):
                 if pos in derived:
