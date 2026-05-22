@@ -681,8 +681,7 @@ class PSBTSigner:
         from embit.silent_payments.bip352 import get_input_hash
         from embit.transaction import COutPoint
         from embit.hashes import hash160
-        from embit import ec
-        from embit.script import p2tr
+        from embit.script import Script
         from embit.util.secp256k1 import (
             ec_pubkey_combine,
             ec_pubkey_parse,
@@ -783,7 +782,10 @@ class PSBTSigner:
 
             for pos, (_, out) in enumerate(sorted_outputs):
                 if pos in derived:
-                    out.script_pubkey = p2tr(ec.PublicKey.from_xonly(derived[pos]))
+                    # BIP-352 places P_k.x directly as the P2TR output key — no
+                    # BIP-341 TapTweak. Wrapping with embit.script.p2tr would
+                    # apply TapTweak(P_k.x) and produce a script Sparrow rejects.
+                    out.script_pubkey = Script(b"\x51\x20" + derived[pos])
 
         gc.collect()
 

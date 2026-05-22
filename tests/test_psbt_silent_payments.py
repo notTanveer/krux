@@ -1060,10 +1060,7 @@ def test_sp_output_script_matches_bip352_reference(m5stickv):
     psbt_script = psbt.outputs[0].script_pubkey
     assert psbt_script is not None, "_derive_sp_output_scripts did not set script_pubkey"
 
-    # bip352.create_outputs() returns the raw internal key P_k (x-only, pre-taproot-tweak).
-    # _derive_sp_output_scripts calls p2tr(from_xonly(P_k)) to build the output script.
-    # Reconstruct the expected script the same way for a correct comparison.
-    from embit.script import p2tr as _p2tr
+    from embit.script import Script
 
     ref_outputs = bip352.create_outputs(
         [(in_priv, False)],
@@ -1071,7 +1068,7 @@ def test_sp_output_script_matches_bip352_reference(m5stickv):
         [sp_address],
     )
     ref_xonly = bytes.fromhex(ref_outputs[sp_address][0])
-    expected_script = _p2tr(ec.PublicKey.from_xonly(ref_xonly))
+    expected_script = Script(b"\x51\x20" + ref_xonly)
 
     assert psbt_script.serialize() == expected_script.serialize(), (
         "SP output mismatch (single input): PSBT=%s BIP-352=%s"
@@ -1152,7 +1149,7 @@ def test_sp_output_script_matches_bip352_two_inputs(m5stickv):
     psbt_script = psbt.outputs[0].script_pubkey
     assert psbt_script is not None, "_derive_sp_output_scripts did not set script_pubkey"
 
-    from embit.script import p2tr as _p2tr
+    from embit.script import Script
 
     ref_outputs = bip352.create_outputs(
         [(in_priv0, False), (in_priv1, False)],
@@ -1160,9 +1157,141 @@ def test_sp_output_script_matches_bip352_two_inputs(m5stickv):
         [sp_address],
     )
     ref_xonly = bytes.fromhex(ref_outputs[sp_address][0])
-    expected_script = _p2tr(ec.PublicKey.from_xonly(ref_xonly))
+    expected_script = Script(b"\x51\x20" + ref_xonly)
 
     assert psbt_script.serialize() == expected_script.serialize(), (
         "SP output mismatch (two inputs): PSBT=%s BIP-352=%s"
         % (psbt_script.data.hex(), expected_script.data.hex())
+    )
+
+
+# ---------------------------------------------------------------------------
+# Change 6 — end-to-end regression test (mimics Sparrow's verifier)
+# ---------------------------------------------------------------------------
+
+
+def _build_two_input_sp_psbt():
+    """Return (raw, priv0, priv1, txid0, vout0, txid1, vout1, sp_address).
+
+    Builds a Sparrow-style PSBTv2 with two P2WPKH inputs (the user's failing
+    case) and one SP output with script_pubkey=None.  The SP recipient uses
+    fixed private keys so the test can re-derive the expected BIP-352 output.
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+        bip352,
+    )
+    from embit import ec
+    from embit.script import p2wpkh
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    fingerprint = root.child(0).fingerprint
+    child0 = root.derive("m/84h/1h/0h/0/0")
+    child1 = root.derive("m/84h/1h/0h/0/1")
+    pub0 = child0.get_public_key()
+    pub1 = child1.get_public_key()
+
+    scan_priv = ec.PrivateKey(bytes.fromhex("31" * 32))
+    spend_priv = ec.PrivateKey(bytes.fromhex("41" * 32))
+    sp_address = bip352.generate_silent_payment_address(
+        scan_priv, spend_priv.get_public_key()
+    )
+    scan_pub, spend_pub = bip352.decode_silent_payment_address(sp_address)
+
+    txid0 = bytes.fromhex("ab" * 32)
+    txid1 = bytes.fromhex("cd" * 32)
+    vout0, vout1 = 0, 3
+
+    psbt = PSBT.create_v2()
+
+    inp0 = InputScope()
+    inp0.txid = txid0
+    inp0.vout = vout0
+    inp0.sequence = 0xFFFFFFFE
+    inp0.witness_utxo = TransactionOutput(value=60_000, script_pubkey=p2wpkh(pub0))
+    inp0.bip32_derivations[pub0] = DerivationPath(
+        fingerprint, parse_path("m/84h/1h/0h/0/0")
+    )
+    psbt.add_input(inp0)
+
+    inp1 = InputScope()
+    inp1.txid = txid1
+    inp1.vout = vout1
+    inp1.sequence = 0xFFFFFFFE
+    inp1.witness_utxo = TransactionOutput(value=80_000, script_pubkey=p2wpkh(pub1))
+    inp1.bip32_derivations[pub1] = DerivationPath(
+        fingerprint, parse_path("m/84h/1h/0h/0/1")
+    )
+    psbt.add_input(inp1)
+
+    out = OutputScope()
+    out.value = 130_000
+    out.script_pubkey = None  # Sparrow-style: omitted, signer must derive
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    return psbt.serialize(), child0.secret, child1.secret, txid0, vout0, txid1, vout1, sp_address
+
+
+def test_sp_two_inputs_output_script_equals_bip352_no_taptweask(m5stickv):
+    """After sign(), SP output scriptPubKey must be OP_1 <P_k.x> — no BIP-341 TapTweak.
+
+    This is the canonical regression for the Sparrow 'address mismatch' bug:
+    the old code wrapped the BIP-352 xonly in p2tr(...) which applies TapTweak;
+    the correct script is built directly as Script(b'\\x51\\x20' + P_k.x).
+
+    Two-input case exercises _combine_shares and A_sum paths that only trigger
+    with ≥2 inputs, matching the user's actual failing transaction.
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.silent_payments import bip352, SilentPaymentsPSBT as PSBT
+    from embit.script import Script
+    from embit.transaction import COutPoint
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    raw, priv0, priv1, txid0, vout0, txid1, vout1, sp_address = (
+        _build_two_input_sp_psbt()
+    )
+    wallet = _make_sp_wallet()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    # Re-derive expected BIP-352 output key independently (Sparrow's verifier does this).
+    ref_outputs = bip352.create_outputs(
+        [(priv0, False), (priv1, False)],
+        [COutPoint(txid=txid0, out_idx=vout0), COutPoint(txid=txid1, out_idx=vout1)],
+        [sp_address],
+    )
+    ref_xonly = bytes.fromhex(ref_outputs[sp_address][0])
+    expected_script = Script(b"\x51\x20" + ref_xonly)
+
+    # Verify against the in-memory signed PSBT.
+    actual = signer.psbt.outputs[0].script_pubkey
+    assert actual is not None, "sign() must derive the SP output script"
+    assert actual.data == expected_script.data, (
+        "SP output script mismatch (Sparrow regression): actual=%s expected=%s"
+        % (actual.data.hex(), expected_script.data.hex())
+    )
+
+    # Also verify the script survives a serialize → parse round-trip.
+    reparsed = PSBT.parse(signer.psbt.serialize())
+    assert reparsed.outputs[0].script_pubkey is not None
+    assert reparsed.outputs[0].script_pubkey.data == expected_script.data, (
+        "SP output script lost in round-trip: reparsed=%s expected=%s"
+        % (reparsed.outputs[0].script_pubkey.data.hex(), expected_script.data.hex())
     )
