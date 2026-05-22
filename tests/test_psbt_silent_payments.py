@@ -990,3 +990,179 @@ def test_sp_signing_global_shares_present_after_roundtrip(m5stickv):
 
     # Full BIP-375 stage-4 validation must pass — mirrors what Sparrow runs.
     BIP375Validator(reparsed).validate(skip_output_scripts=False)
+
+
+def test_sp_output_script_matches_bip352_reference(m5stickv):
+    """_derive_sp_output_scripts must produce the BIP-352-correct address (single input).
+
+    Regression for two bugs fixed together:
+    - Bug 1: missing input_hash multiplication (a_sum * B_scan instead of
+      input_hash * a_sum * B_scan)
+    - Bug 2: 32-byte x-only shared secret instead of 33-byte compressed point
+      passed to the BIP0352/SharedSecret tagged hash.
+
+    The test manually installs per-input ECDH shares, then calls
+    _derive_sp_output_scripts() and asserts the derived x-only pubkey matches
+    bip352.create_outputs() (the authoritative BIP-352 reference).
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit import ec
+    from embit.bip32 import parse_path
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        bip352,
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit.silent_payments.ecdh import compute_ecdh_share
+    from embit.script import p2wpkh
+    from embit.transaction import TransactionOutput, COutPoint
+    from krux.psbt import PSBTSigner
+
+    in_priv = bytes.fromhex("aa" * 32)
+    in_pub = ec.PrivateKey(in_priv).get_public_key()
+    txid = bytes.fromhex("ab" * 32)
+    vout = 7
+
+    psbt = PSBT.create_v2()
+
+    inp = InputScope()
+    inp.txid = txid
+    inp.vout = vout
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(value=60_000, script_pubkey=p2wpkh(in_pub))
+    inp.bip32_derivations[in_pub] = DerivationPath(b"\x00" * 4, parse_path("m/84h/0h/0h/0/0"))
+    psbt.add_input(inp)
+
+    scan_priv = ec.PrivateKey(bytes.fromhex("31" * 32))
+    spend_priv = ec.PrivateKey(bytes.fromhex("41" * 32))
+    sp_address = bip352.generate_silent_payment_address(scan_priv, spend_priv.get_public_key())
+    scan_pub, spend_pub = bip352.decode_silent_payment_address(sp_address)
+
+    out = OutputScope()
+    out.value = 50_000
+    out.script_pubkey = None
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    scan_key_bytes = scan_pub.sec()
+    psbt.inputs[0].sp_ecdh_shares[scan_key_bytes] = compute_ecdh_share(in_priv, scan_pub)
+
+    signer = object.__new__(PSBTSigner)
+    signer.psbt = psbt
+    signer._derive_sp_output_scripts()
+
+    psbt_script = psbt.outputs[0].script_pubkey
+    assert psbt_script is not None, "_derive_sp_output_scripts did not set script_pubkey"
+
+    # bip352.create_outputs() returns the raw internal key P_k (x-only, pre-taproot-tweak).
+    # _derive_sp_output_scripts calls p2tr(from_xonly(P_k)) to build the output script.
+    # Reconstruct the expected script the same way for a correct comparison.
+    from embit.script import p2tr as _p2tr
+
+    ref_outputs = bip352.create_outputs(
+        [(in_priv, False)],
+        [COutPoint(txid=txid, out_idx=vout)],
+        [sp_address],
+    )
+    ref_xonly = bytes.fromhex(ref_outputs[sp_address][0])
+    expected_script = _p2tr(ec.PublicKey.from_xonly(ref_xonly))
+
+    assert psbt_script.serialize() == expected_script.serialize(), (
+        "SP output mismatch (single input): PSBT=%s BIP-352=%s"
+        % (psbt_script.data.hex(), expected_script.data.hex())
+    )
+
+
+def test_sp_output_script_matches_bip352_two_inputs(m5stickv):
+    """_derive_sp_output_scripts must produce the BIP-352-correct address (two inputs).
+
+    Two-input variant: verifies that A_sum is correctly computed over both
+    eligible input pubkeys for input_hash, and that shares are combined before
+    the tweak is applied.
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit import ec
+    from embit.bip32 import parse_path
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        bip352,
+        SilentPaymentData,
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit.silent_payments.ecdh import compute_ecdh_share
+    from embit.script import p2wpkh
+    from embit.transaction import TransactionOutput, COutPoint
+    from krux.psbt import PSBTSigner
+
+    in_priv0 = bytes.fromhex("11" * 32)
+    in_priv1 = bytes.fromhex("22" * 32)
+    in_pub0 = ec.PrivateKey(in_priv0).get_public_key()
+    in_pub1 = ec.PrivateKey(in_priv1).get_public_key()
+    txid0 = bytes.fromhex("ab" * 32)
+    txid1 = bytes.fromhex("cd" * 32)
+
+    psbt = PSBT.create_v2()
+
+    inp0 = InputScope()
+    inp0.txid = txid0
+    inp0.vout = 0
+    inp0.sequence = 0xFFFFFFFE
+    inp0.witness_utxo = TransactionOutput(value=50_000, script_pubkey=p2wpkh(in_pub0))
+    inp0.bip32_derivations[in_pub0] = DerivationPath(b"\x00" * 4, parse_path("m/84h/0h/0h/0/0"))
+    psbt.add_input(inp0)
+
+    inp1 = InputScope()
+    inp1.txid = txid1
+    inp1.vout = 2
+    inp1.sequence = 0xFFFFFFFE
+    inp1.witness_utxo = TransactionOutput(value=70_000, script_pubkey=p2wpkh(in_pub1))
+    inp1.bip32_derivations[in_pub1] = DerivationPath(b"\x00" * 4, parse_path("m/84h/0h/0h/0/1"))
+    psbt.add_input(inp1)
+
+    scan_priv = ec.PrivateKey(bytes.fromhex("31" * 32))
+    spend_priv = ec.PrivateKey(bytes.fromhex("41" * 32))
+    sp_address = bip352.generate_silent_payment_address(scan_priv, spend_priv.get_public_key())
+    scan_pub, spend_pub = bip352.decode_silent_payment_address(sp_address)
+
+    out = OutputScope()
+    out.value = 90_000
+    out.script_pubkey = None
+    out.sp_data = SilentPaymentData(scan_pub, spend_pub)
+    psbt.add_output(out)
+    psbt.tx_modifiable_flags = 0
+
+    scan_key_bytes = scan_pub.sec()
+    psbt.inputs[0].sp_ecdh_shares[scan_key_bytes] = compute_ecdh_share(in_priv0, scan_pub)
+    psbt.inputs[1].sp_ecdh_shares[scan_key_bytes] = compute_ecdh_share(in_priv1, scan_pub)
+
+    signer = object.__new__(PSBTSigner)
+    signer.psbt = psbt
+    signer._derive_sp_output_scripts()
+
+    psbt_script = psbt.outputs[0].script_pubkey
+    assert psbt_script is not None, "_derive_sp_output_scripts did not set script_pubkey"
+
+    from embit.script import p2tr as _p2tr
+
+    ref_outputs = bip352.create_outputs(
+        [(in_priv0, False), (in_priv1, False)],
+        [COutPoint(txid=txid0, out_idx=0), COutPoint(txid=txid1, out_idx=2)],
+        [sp_address],
+    )
+    ref_xonly = bytes.fromhex(ref_outputs[sp_address][0])
+    expected_script = _p2tr(ec.PublicKey.from_xonly(ref_xonly))
+
+    assert psbt_script.serialize() == expected_script.serialize(), (
+        "SP output mismatch (two inputs): PSBT=%s BIP-352=%s"
+        % (psbt_script.data.hex(), expected_script.data.hex())
+    )
