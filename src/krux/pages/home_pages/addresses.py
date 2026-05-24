@@ -180,6 +180,9 @@ class Addresses(Page):
         return MENU_CONTINUE
 
     def _receive_change_menu(self, callback):
+        if self.ctx.wallet.is_silent_payment():
+            callback(0)
+            return MENU_CONTINUE
         submenu = Menu(
             self.ctx,
             [
