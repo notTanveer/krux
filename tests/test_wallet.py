@@ -534,6 +534,9 @@ def test_init_silent_payment(mocker, m5stickv, tdata):
     assert wallet.label == "Single-sig SP"
     assert wallet.policy == {"type": P2TR}
     assert wallet.descriptor is not None
+    # Descriptor must include the real fingerprint and account derivation path, not zeroed out
+    descriptor_str = str(wallet.descriptor)
+    assert "[55f8fc5d/352h/1h/0h]" in descriptor_str
 
     addresses = list(wallet.obtain_addresses(i=0, limit=1))
     assert len(addresses) == 1
