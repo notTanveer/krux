@@ -205,6 +205,12 @@ class PSBTSigner:
 
         return has_sp_outputs(self.psbt)
 
+    def has_sp_spend_inputs(self):
+        """Returns True if any input carries a BIP-376 sp_tweak field"""
+        return any(
+            getattr(inp, "sp_tweak", None) is not None for inp in self.psbt.inputs
+        )
+
     def _silent_payment_address_from_output(self, out):
         """Delegates to silent_payments.address_from_output."""
         from .silent_payments import address_from_output
@@ -272,6 +278,22 @@ class PSBTSigner:
                 if textual_path != self.wallet.key.derivation:
                     if textual_path not in mismatched_paths:
                         mismatched_paths.append(textual_path)
+            # SP spend inputs use sp_spend_bip32_derivations (no taproot leaf hashes)
+            if self.policy["type"] == P2TR and self.wallet.is_silent_payment():
+                sp_derivations = getattr(_input, "sp_spend_bip32_derivations", {})
+                for pub_bytes, derivation in sp_derivations.items():
+                    if derivation.fingerprint != self.wallet.key.fingerprint:
+                        continue
+                    derivation_path = derivation.derivation
+                    textual_path = "m"
+                    for index in derivation_path[:der_path_nodes]:
+                        if index >= 2**31:
+                            textual_path += "/{}h".format(index - 2**31)
+                        else:
+                            textual_path += "/{}".format(index)
+                    if textual_path != self.wallet.key.derivation:
+                        if textual_path not in mismatched_paths:
+                            mismatched_paths.append(textual_path)
         if mismatched_paths:
             return Key.format_derivation(", ".join(mismatched_paths))
         return ""
@@ -794,6 +816,35 @@ class PSBTSigner:
         self.check_sighash()
         sigs_added = self.psbt.sign_with(self.wallet.key.root)
         if sigs_added == 0:
+            if self.wallet.is_silent_payment():
+                if getattr(self.psbt, "version", 0) != 2:
+                    raise ValueError("SP spend requires PSBTv2")
+                if not self.has_sp_spend_inputs():
+                    raise ValueError(
+                        "Coordinator must include BIP-376 sp_tweak field"
+                    )
+                all_empty = all(
+                    not getattr(inp, "sp_spend_bip32_derivations", None)
+                    for inp in self.psbt.inputs
+                    if getattr(inp, "sp_tweak", None) is not None
+                )
+                if all_empty:
+                    raise ValueError("Missing sp_spend_bip32_derivations")
+                wallet_fp = self.wallet.key.fingerprint
+                for inp in self.psbt.inputs:
+                    if getattr(inp, "sp_tweak", None) is None:
+                        continue
+                    for pub_bytes, derivation in inp.sp_spend_bip32_derivations.items():
+                        if derivation.fingerprint != wallet_fp:
+                            raise ValueError(
+                                "Fingerprint mismatch: wallet=%s PSBT=%s"
+                                % (wallet_fp.hex(), derivation.fingerprint.hex())
+                            )
+                        derived = self.wallet.key.root.derive(derivation.derivation)
+                        if derived.xonly() != pub_bytes[1:]:
+                            raise ValueError(
+                                "Derived key xonly doesn't match sp_spend pubkey"
+                            )
             raise ValueError("cannot sign")
 
     def fill_zero_fingerprint(self):
@@ -827,6 +878,19 @@ class PSBTSigner:
                 if self.wallet.key.get_xpub(derivation.derivation).key == pub:
                     derivation.fingerprint = self.wallet.key.fingerprint
                     filled += 1
+        # Also fill zero fingerprints in sp_spend_bip32_derivations for SP wallets
+        if self.wallet.is_silent_payment():
+            for pub_bytes, derivation in getattr(
+                scope, "sp_spend_bip32_derivations", {}
+            ).items():
+                if derivation.fingerprint == b"\x00\x00\x00\x00":
+                    try:
+                        derived = self.wallet.key.root.derive(derivation.derivation)
+                        if derived.xonly() == pub_bytes[1:]:
+                            derivation.fingerprint = self.wallet.key.fingerprint
+                            filled += 1
+                    except Exception:
+                        pass
         return filled
 
     def sign(self, trim=True):
@@ -845,6 +909,12 @@ class PSBTSigner:
             self._validate_silent_payment(skip_output_scripts=False)
 
         self.add_signatures()
+
+        if self.has_sp_spend_inputs():
+            from embit.silent_payments import finalize_sp_spends
+
+            finalize_sp_spends(self.psbt)
+            gc.collect()
 
         if not trim:
             return
@@ -883,6 +953,15 @@ class PSBTSigner:
             # Preserve taproot script path sigs
             if inp.taproot_sigs:
                 trimmed_psbt.inputs[i].taproot_sigs = inp.taproot_sigs
+
+            # Preserve BIP-376 fields for SP spend inputs (defensive: finalize_sp_spends
+            # clears these, but preserve them if still present for trim=False-like paths).
+            if getattr(inp, "sp_tweak", None) is not None:
+                trimmed_psbt.inputs[i].sp_tweak = inp.sp_tweak
+            if getattr(inp, "sp_spend_bip32_derivations", None):
+                trimmed_psbt.inputs[i].sp_spend_bip32_derivations = (
+                    inp.sp_spend_bip32_derivations
+                )
 
             # Preserve BIP-375 per-input SP ECDH shares and DLEQ proofs.
             # Assign unconditionally: an empty OrderedDict is falsy but valid;

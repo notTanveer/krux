@@ -1295,3 +1295,226 @@ def test_sp_two_inputs_output_script_equals_bip352_no_taptweask(m5stickv):
         "SP output script lost in round-trip: reparsed=%s expected=%s"
         % (reparsed.outputs[0].script_pubkey.data.hex(), expected_script.data.hex())
     )
+
+
+# ---------------------------------------------------------------------------
+# SP spend flow (BIP-376) — spending received P2TR UTXOs
+# ---------------------------------------------------------------------------
+
+
+def _make_sp_spend_wallet():
+    """Return a Krux Wallet with TYPE_SILENT_PAYMENT and the test mnemonic (testnet)."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.networks import NETWORKS
+    from krux.key import Key, TYPE_SILENT_PAYMENT
+    from krux.wallet import Wallet
+
+    return Wallet(Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, NETWORKS["test"]))
+
+
+def _build_sp_spend_psbt(tweak=None, fingerprint=None, wrong_key=False, no_tweak=False):
+    """Build a PSBTv2 with one P2TR SP-spend input and one P2WPKH output.
+
+    tweak: 32-byte SP tweak. Defaults to bytes(range(1, 33)).
+    fingerprint: 4-byte master fingerprint override.
+    wrong_key: use a non-SP key in sp_spend_bip32_derivations.
+    no_tweak: omit sp_tweak and sp_spend_bip32_derivations entirely.
+    """
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.psbt import DerivationPath
+    from embit.silent_payments import (
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit import ec
+    from embit.script import Script, p2wpkh
+    from embit.transaction import TransactionOutput
+
+    seed = mnemonic_to_seed(TEST_MNEMONIC)
+    root = HDKey.from_seed(seed)
+    master_fp = root.child(0).fingerprint
+
+    spend_path = "m/352h/1h/0h/0h/0"
+    spend_hdkey = root.derive(spend_path)
+    spend_privkey = spend_hdkey.key
+    spend_pub = spend_privkey.get_public_key()
+
+    if wrong_key:
+        wrong_hdkey = root.derive("m/84h/1h/0h/0/0")
+        spend_pub = wrong_hdkey.get_public_key()
+
+    if tweak is None:
+        tweak = bytes(range(1, 33))
+
+    tweaked_key = spend_privkey.sp_spend_tweak(tweak)
+    tweaked_xonly = tweaked_key.xonly()
+    utxo_script = Script(b"\x51\x20" + tweaked_xonly)
+
+    fp = fingerprint if fingerprint is not None else master_fp
+
+    psbt = PSBT.create_v2()
+
+    inp = InputScope()
+    inp.txid = bytes(32)
+    inp.vout = 0
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=utxo_script)
+    if not no_tweak:
+        inp.sp_tweak = tweak
+        inp.sp_spend_bip32_derivations[spend_pub.sec()] = DerivationPath(
+            fp, parse_path(spend_path)
+        )
+    psbt.add_input(inp)
+
+    out_priv = ec.PrivateKey(bytes([0x33] * 32))
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = p2wpkh(out_priv.get_public_key())
+    psbt.add_output(out)
+
+    return psbt.serialize()
+
+
+def test_sp_spend_signs_successfully(m5stickv):
+    """PSBTv2 with BIP-376 sp_tweak fields signs and produces final_scriptwitness."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_spend_wallet()
+    raw = _build_sp_spend_psbt()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    inp = signer.psbt.inputs[0]
+    assert inp.final_scriptwitness is not None, "sign() must produce final_scriptwitness"
+    assert len(inp.final_scriptwitness.items) == 1
+    sig = inp.final_scriptwitness.items[0]
+    assert len(sig) in (64, 65), "Schnorr sig must be 64 or 65 bytes"
+
+
+def test_sp_spend_finalization(m5stickv):
+    """After sign(), finalize_sp_spends clears sp_tweak and sp_spend_bip32_derivations."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_spend_wallet()
+    raw = _build_sp_spend_psbt()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    inp = signer.psbt.inputs[0]
+    assert inp.sp_tweak is None, "finalize must clear sp_tweak"
+    assert not inp.sp_spend_bip32_derivations, "finalize must clear sp_spend_bip32_derivations"
+    assert inp.taproot_key_sig is None, "finalize must clear taproot_key_sig"
+    sig = inp.final_scriptwitness.items[0]
+    assert len(sig) in (64, 65), "Schnorr sig must be 64 or 65 bytes"
+
+
+def test_sp_spend_roundtrip(m5stickv):
+    """Signed SP spend PSBT survives serialize → parse with final_scriptwitness intact."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.silent_payments import SilentPaymentsPSBT as PSBT
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_spend_wallet()
+    raw = _build_sp_spend_psbt()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    reparsed = PSBT.parse(signer.psbt.serialize())
+    assert reparsed.inputs[0].final_scriptwitness is not None
+    sig1 = signer.psbt.inputs[0].final_scriptwitness.items[0]
+    sig2 = reparsed.inputs[0].final_scriptwitness.items[0]
+    assert sig1 == sig2, "signature must survive round-trip"
+
+
+def test_sp_spend_no_tweak_error(m5stickv):
+    """SP wallet with P2TR input missing sp_tweak raises a descriptive error."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from embit.bip32 import HDKey, parse_path
+    from embit.bip39 import mnemonic_to_seed
+    from embit.silent_payments import (
+        SilentPaymentsPSBT as PSBT,
+        SPInputScope as InputScope,
+        SPOutputScope as OutputScope,
+    )
+    from embit import ec
+    from embit.script import Script, p2wpkh
+    from embit.transaction import TransactionOutput
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    # Build a plain P2TR UTXO with no sp_tweak
+    some_priv = ec.PrivateKey(bytes([0x11] * 32))
+    some_xonly = some_priv.get_public_key().xonly()
+    utxo_script = Script(b"\x51\x20" + some_xonly)
+
+    psbt = PSBT.create_v2()
+    inp = InputScope()
+    inp.txid = bytes(32)
+    inp.vout = 0
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=utxo_script)
+    psbt.add_input(inp)
+
+    out_priv = ec.PrivateKey(bytes([0x33] * 32))
+    out = OutputScope()
+    out.value = 99_000
+    out.script_pubkey = p2wpkh(out_priv.get_public_key())
+    psbt.add_output(out)
+
+    raw = psbt.serialize()
+    wallet = _make_sp_spend_wallet()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    with pytest.raises(ValueError, match="sp_tweak"):
+        signer.sign()
+
+
+def test_sp_spend_fingerprint_mismatch_error(m5stickv):
+    """Wrong fingerprint in sp_spend_bip32_derivations raises a descriptive error."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_spend_wallet()
+    raw = _build_sp_spend_psbt(fingerprint=b"\xde\xad\xbe\xef")
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    with pytest.raises(ValueError, match="Fingerprint mismatch"):
+        signer.sign()
+
+
+def test_sp_send_still_works(m5stickv):
+    """Regression: existing SP send flow (SINGLESIG wallet + SP outputs) still works."""
+    import sys
+
+    sys.path.insert(0, "vendor/embit/src")
+    from krux.psbt import PSBTSigner
+    from krux.qr import FORMAT_NONE
+
+    wallet = _make_sp_wallet()
+    raw = _build_sp_psbt_bytes()
+    signer = PSBTSigner(wallet, raw, FORMAT_NONE)
+    signer.sign()
+
+    scan_key_bytes = bytes.fromhex(_SCAN_PUB_HEX)
+    assert scan_key_bytes in signer.psbt.inputs[0].sp_ecdh_shares
