@@ -286,10 +286,13 @@ class Key:
         return ser
 
     def sp_scan_key_encoded(self, network_name):
-        """Returns the BIP-352 scan key encoded as a bech32m spscan string"""
+        """Returns the BIP-352 scan key as a key expression with fingerprint/derivation prefix"""
         from embit.descriptor.sp import SPScanKey
+        from embit.descriptor.arguments import KeyOrigin
+        from embit.bip32 import parse_path
 
-        return SPScanKey(self.scan_privkey, self.spend_pubkey, network=network_name).encode()
+        origin = KeyOrigin(self.fingerprint, parse_path(self.derivation))
+        return str(SPScanKey(self.scan_privkey, self.spend_pubkey, origin=origin, network=network_name))
 
     def sp_address(self, network_name):
         """Returns the BIP-352 silent payment address"""

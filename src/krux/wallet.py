@@ -78,10 +78,17 @@ class Wallet:
             self.policy = {"type": self.get_scriptpubkey_type()}
         elif self.key and self.key.policy_type == TYPE_SILENT_PAYMENT:
             from embit.descriptor.sp import SPScanKey, SilentPaymentDescriptor
+            from embit.descriptor.arguments import KeyOrigin
+            from embit.bip32 import parse_path
 
             net_name = self.which_network()
+            origin = KeyOrigin(
+                self.key.fingerprint,
+                parse_path(self.key.derivation),
+            )
             sp_scan_key = SPScanKey(
-                self.key.scan_privkey, self.key.spend_pubkey, network=net_name
+                self.key.scan_privkey, self.key.spend_pubkey,
+                origin=origin, network=net_name,
             )
             self.descriptor = SilentPaymentDescriptor(sp_key=sp_scan_key)
             self.label = t(NAME_SILENT_PAYMENT)

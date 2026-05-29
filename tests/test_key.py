@@ -575,7 +575,9 @@ def test_init_silent_payment(mocker, m5stickv, tdata):
     assert address.startswith("tsp1")
 
     spscan = key.sp_scan_key_encoded("test")
-    assert spscan.startswith("tspscan1")
+    # key expression includes [fingerprint/derivation] prefix
+    assert "]tspscan1" in spscan
+    assert spscan.startswith("[")
 
 
 def test_xpub(mocker, m5stickv, tdata):
