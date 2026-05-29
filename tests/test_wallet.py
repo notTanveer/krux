@@ -20,6 +20,7 @@ def tdata(mocker):
         TYPE_SINGLESIG,
         TYPE_MULTISIG,
         TYPE_MINISCRIPT,
+        TYPE_SILENT_PAYMENT,
     )
 
     TEST_MNEMONIC1 = (
@@ -511,6 +512,35 @@ def test_init_miniscript(mocker, m5stickv, tdata):
     assert wallet.descriptor is None
     assert wallet.label is None
     assert wallet.policy is None
+
+
+def test_init_silent_payment(mocker, m5stickv, tdata):
+    from krux.wallet import Wallet
+    from krux.key import Key, TYPE_SILENT_PAYMENT, P2TR
+    from embit.networks import NETWORKS
+
+    key = Key(
+        "olympic term tissue route sense program under choose bean emerge velvet absurd",
+        TYPE_SILENT_PAYMENT,
+        NETWORKS["test"],
+    )
+    wallet = Wallet(key)
+
+    assert isinstance(wallet, Wallet)
+    assert wallet.is_silent_payment()
+    assert not wallet.is_multisig()
+    assert not wallet.is_miniscript()
+    assert wallet.has_change_addr() is False
+    assert wallet.label == "Single-sig SP"
+    assert wallet.policy == {"type": P2TR}
+    assert wallet.descriptor is not None
+
+    addresses = list(wallet.obtain_addresses(i=0, limit=1))
+    assert len(addresses) == 1
+    assert addresses[0].startswith("tsp1")
+
+    addresses_from_1 = list(wallet.obtain_addresses(i=1, limit=1))
+    assert len(addresses_from_1) == 0
 
 
 def test_is_multisig(mocker, m5stickv, tdata):

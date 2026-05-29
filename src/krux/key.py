@@ -72,12 +72,14 @@ P2TR = "p2tr"
 NAME_SINGLE_SIG = "Single-sig"
 NAME_MULTISIG = "Multisig"
 NAME_MINISCRIPT = "Miniscript"
+NAME_SILENT_PAYMENT = "Single-sig SP"
 
 # Policy types names
 POLICY_TYPE_NAMES = [
     NAME_SINGLE_SIG,
     NAME_MULTISIG,
     NAME_MINISCRIPT,
+    NAME_SILENT_PAYMENT,
 ]
 
 SINGLESIG_SCRIPT_NAMES = [
@@ -90,6 +92,10 @@ SINGLESIG_SCRIPT_NAMES = [
 MULTISIG_SCRIPT_NAMES = ["Legacy - 45", "Nested Segwit - 48", "Native Segwit - 48"]
 
 MINISCRIPT_SCRIPT_NAMES = ["Native Segwit - 48", "Taproot - 48"]
+
+SILENT_PAYMENT_SCRIPT_NAMES = ["Taproot - 352"]
+
+DER_SILENT_PAYMENT = "m/352h/%dh/%dh"
 
 
 # Single-sig script types supported by Krux
@@ -124,11 +130,13 @@ MINISCRIPT_PURPOSE = 48
 TYPE_SINGLESIG = 0
 TYPE_MULTISIG = 1
 TYPE_MINISCRIPT = 2
+TYPE_SILENT_PAYMENT = 3
 
 POLICY_TYPE_IDS = {
     NAME_SINGLE_SIG: TYPE_SINGLESIG,
     NAME_MULTISIG: TYPE_MULTISIG,
     NAME_MINISCRIPT: TYPE_MINISCRIPT,
+    NAME_SILENT_PAYMENT: TYPE_SILENT_PAYMENT,
 }
 
 # Reverse mapping: policy type ID to name
@@ -136,6 +144,7 @@ POLICY_TYPE_NAMES_MAP = {
     TYPE_SINGLESIG: NAME_SINGLE_SIG,
     TYPE_MULTISIG: NAME_MULTISIG,
     TYPE_MINISCRIPT: NAME_MINISCRIPT,
+    TYPE_SILENT_PAYMENT: NAME_SILENT_PAYMENT,
 }
 
 
@@ -174,6 +183,10 @@ class Key:
         if policy_type == TYPE_MINISCRIPT and script_type not in (P2WSH, P2TR):
             script_type = P2WSH
 
+        # SP always uses P2TR
+        if policy_type == TYPE_SILENT_PAYMENT:
+            script_type = P2TR
+
         self.script_type = script_type
         self.root = Key.extract_root(mnemonic, passphrase, network)
         self.fingerprint = self.root.child(0).fingerprint
@@ -184,6 +197,15 @@ class Key:
         else:
             self.derivation = derivation
         self.account = self.root.derive(self.derivation).to_public()
+
+        if policy_type == TYPE_SILENT_PAYMENT:
+            self.scan_privkey = self.root.derive(self.derivation + "/1h/0").key
+            self.spend_privkey = self.root.derive(self.derivation + "/0h/0").key
+            self.spend_pubkey = self.spend_privkey.get_public_key()
+        else:
+            self.scan_privkey = None
+            self.spend_privkey = None
+            self.spend_pubkey = None
 
     def __eq__(self, other):
         return self.__dict__ == other.__dict__
@@ -263,6 +285,20 @@ class Key:
         )
         return ser
 
+    def sp_scan_key_encoded(self, network_name):
+        """Returns the BIP-352 scan key encoded as a bech32m spscan string"""
+        from embit.descriptor.sp import SPScanKey
+
+        return SPScanKey(self.scan_privkey, self.spend_pubkey, network=network_name).encode()
+
+    def sp_address(self, network_name):
+        """Returns the BIP-352 silent payment address"""
+        from embit.silent_payments.bip352 import generate_silent_payment_address
+
+        return generate_silent_payment_address(
+            self.scan_privkey, self.spend_pubkey, network=network_name
+        )
+
     @staticmethod
     def pick_final_word(entropy, words):
         """Returns a random final word with a valid checksum for the given list of
@@ -310,6 +346,11 @@ class Key:
         if policy_type == TYPE_MINISCRIPT:
             return DER_MINISCRIPT % (
                 MINISCRIPT_PURPOSE,
+                network["bip32"],
+                0 if account is None else account,
+            )
+        if policy_type == TYPE_SILENT_PAYMENT:
+            return DER_SILENT_PAYMENT % (
                 network["bip32"],
                 0 if account is None else account,
             )
