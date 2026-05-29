@@ -245,6 +245,7 @@
     "SD card not detected.": "SDカードが検出されません.",
     "SHA256 of rolls:": "ロールのSHA256:",
     "SHA256 of snapshot:": "画像のSHA256:",
+    "SPSCAN": "SPSCAN",
     "Save QR Image to SD Card": "QR画像をSDカードに保存する",
     "Save to SD card": "SDカードに保存する",
     "Save to SD card?": "SDカードに保存しますか?",
