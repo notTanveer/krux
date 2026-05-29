@@ -1,6 +1,7 @@
 [submodule "embit"]
 	path = vendor/embit
-	url = ../../diybitcoinhardware/embit
+	url = ../../selfcustody/embit
+	branch = feat/sp-phase1
 [submodule "urtypes"]
 	path = vendor/urtypes
 	url = ../../selfcustody/urtypes
