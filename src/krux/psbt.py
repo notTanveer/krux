@@ -59,6 +59,7 @@ class PSBTSigner:
         self.qr_format = qr_format
         self.policy = None
         self.is_b64_file = False
+        self._has_sp = False
 
         # Parse the PSBT
         if psbt_filename:
@@ -191,7 +192,8 @@ class PSBTSigner:
         # BIP-375 Silent Payment validation lives in src/krux/silent_payments.py;
         # only fires when the PSBT actually carries SP outputs, so SP-naive
         # flows pay zero cost.
-        if self.has_sp_outputs():
+        self._has_sp = self.has_sp_outputs()
+        if self._has_sp:
             # Only check policy eligibility at load time. Full BIP-375
             # structural validation (including ECDH-coverage) runs after
             # _populate_silent_payment_outputs() in sign(), because PSBTv2
@@ -525,7 +527,7 @@ class PSBTSigner:
             self.wallet.key.root.secret + self.wallet.key.fingerprint + psbt_hash
         ).digest()
 
-    def _eligible_input_privkeys(self):
+    def _eligible_input_privkeys(self, eligible):
         """Returns (secret, is_xonly) for each eligible input owned by the wallet.
 
         Walks the BIP-375-eligible inputs, matches each input's BIP-32
@@ -534,12 +536,10 @@ class PSBTSigner:
         Shared by global-share population and output-script derivation so the
         two stay in lock-step.
         """
-        from embit.silent_payments.ecdh import get_eligible_inputs
-
         root = self.wallet.key.root
         fingerprint = root.my_fingerprint
         privkeys = []
-        for i in get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True):
+        for i in eligible:
             inp = self.psbt.inputs[i]
             is_xonly = (
                 inp.script_pubkey is not None
@@ -555,7 +555,7 @@ class PSBTSigner:
                 break
         return privkeys
 
-    def _populate_silent_payment_outputs(self, input_privkeys):
+    def _populate_silent_payment_outputs(self, input_privkeys, eligible):
         """Discard incoming SP fields and compute fresh ECDH shares + DLEQ proofs.
 
         Incoming SP data is explicitly cleared before derivation — Krux is
@@ -564,7 +564,6 @@ class PSBTSigner:
         added; a future receive module must derive its own logic.
         """
         from embit.silent_payments.ecdh import (
-            get_eligible_inputs,
             compute_global_ecdh_share,
             compute_global_dleq_proof,
         )
@@ -577,8 +576,6 @@ class PSBTSigner:
         for inp in self.psbt.inputs:
             inp.sp_ecdh_shares.clear()
             inp.sp_dleq_proofs.clear()
-
-        self._validate_sp_signing_inputs()
 
         wallet_nonce = self._sp_wallet_nonce()
 
@@ -595,7 +592,6 @@ class PSBTSigner:
         # Strict post-sign assertion — every eligible input must carry per-input
         # SP fields. _sign_with_sp silently skips inputs whose derivation
         # matching fails; catch that here before the QR is rendered.
-        eligible = get_eligible_inputs(self.psbt.inputs, has_sp_outputs=True)
         scan_key_objects = {}
         for out in self.psbt.outputs:
             if out.sp_data is not None:
@@ -636,6 +632,8 @@ class PSBTSigner:
         _sign_with_sp has several silent-return-0 paths. Running the same
         checks here turns each into a descriptive ValueError so the user
         (and developers) can see exactly what went wrong.
+
+        Returns the list of eligible input indices for reuse by callers.
         """
         from embit.silent_payments.ecdh import get_eligible_inputs
         from embit.silent_payments.fields import SPValidationError
@@ -672,6 +670,8 @@ class PSBTSigner:
                 raise ValueError(
                     "Silent Payment signing failed: input %d fingerprint mismatch" % i
                 )
+
+        return eligible
 
     def _derive_sp_output_scripts(self, input_privkeys):
         """Derive P2TR scripts for SP outputs that have script_pubkey=None.
@@ -785,17 +785,17 @@ class PSBTSigner:
 
     def sign(self, trim=True):
         """Signs the PSBT and preserves necessary fields for the final transaction"""
-        # Computed once: each call scans every output and lazily imports the SP
-        # module. The trim below preserves sp_data, so this also holds for the
-        # rebuilt PSBT.
-        has_sp = self.has_sp_outputs()
+        # _has_sp is set by validate(); the trim below preserves sp_data, so
+        # it also holds for the rebuilt PSBT.
+        has_sp = self._has_sp
         if has_sp:
-            input_privkeys = self._eligible_input_privkeys()
+            eligible = self._validate_sp_signing_inputs()
+            input_privkeys = self._eligible_input_privkeys(eligible)
 
             # Populate per-input ECDH shares + DLEQ proofs with Krux entropy.
             # Incoming SP fields are discarded inside
             # _populate_silent_payment_outputs.
-            self._populate_silent_payment_outputs(input_privkeys)
+            self._populate_silent_payment_outputs(input_privkeys, eligible)
 
             # Derive P2TR output scripts for SP outputs that are still empty.
             # Coordinators omit PSBT_OUT_SCRIPT for SP outputs per BIP-375; the
