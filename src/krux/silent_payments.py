@@ -100,4 +100,6 @@ def validate_eligibility(policy):
         )
     policy_type = policy.get("type") if policy else None
     if policy_type not in (P2PKH, P2WPKH, P2SH_P2WPKH):
-        raise ValueError("Silent Payments require P2PKH, P2WPKH, or P2SH-P2WPKH inputs")
+        raise ValueError(
+            "Silent Payments require non-taproot inputs: P2PKH, P2WPKH, or P2SH-P2WPKH"
+        )
