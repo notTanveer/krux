@@ -171,7 +171,6 @@ class Addresses(Page):
     def _silent_payment_address_view(self):
         """Show the BIP-352 reusable SP address as separate text or QR entries,
         since it is too long to fit alongside its QR code on most screens"""
-        from ...sd_card import ADDRESSES_FILE_EXTENSION
 
         addr = self.ctx.wallet.obtain_sp_address()
 
@@ -184,14 +183,7 @@ class Addresses(Page):
                     (
                         None
                         if not self.has_sd_card()
-                        else lambda: SaveFile(self.ctx).save_file(
-                            addr,
-                            "address",
-                            "address",
-                            t("Address") + ": ",
-                            ADDRESSES_FILE_EXTENSION,
-                            save_as_binary=False,
-                        )
+                        else lambda: SaveFile(self.ctx).save_to_sd(addr, "sp-address")
                     ),
                 ),
             ]

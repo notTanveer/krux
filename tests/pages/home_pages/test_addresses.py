@@ -1244,8 +1244,8 @@ def test_silent_payment_address(mocker, m5stickv, tdata):
     mocker.patch.object(addresses_ui, "has_sd_card", return_value=True)
     mock_show_address = mocker.patch.object(addresses_ui, "show_address")
     mock_save_file = mocker.patch("krux.pages.file_operations.SaveFile")
-    # save_file must return a non-MENU_CONTINUE status so the SD submenu exits
-    mock_save_file.return_value.save_file.return_value = MENU_EXIT
+    # save_to_sd must return a non-MENU_CONTINUE status so the SD submenu exits
+    mock_save_file.return_value.save_to_sd.return_value = MENU_EXIT
 
     assert addresses_ui.addresses_menu() == MENU_CONTINUE
     assert ctx.input.wait_for_button.call_count == len(BTN_SEQUENCE)
@@ -1258,5 +1258,5 @@ def test_silent_payment_address(mocker, m5stickv, tdata):
     assert mock_show_address.call_args.kwargs["quick_exit"] is True
 
     # Text path offers the full address for saving to SD card
-    mock_save_file.return_value.save_file.assert_called_once()
-    assert mock_save_file.return_value.save_file.call_args.args[0] == addr
+    mock_save_file.return_value.save_to_sd.assert_called_once()
+    assert mock_save_file.return_value.save_to_sd.call_args.args[0] == addr
