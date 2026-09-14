@@ -69,17 +69,7 @@ class PubkeyView(Page):
                     (
                         None
                         if not self.has_sd_card()
-                        # SD exports the scan key with its origin (not the full
-                        # sp(...) descriptor), matching the QR and what the
-                        # Sparrow coordinator expects.
-                        else lambda: SaveFile(self.ctx).save_file(
-                            spscan,
-                            "SPSCAN",
-                            "SPSCAN",
-                            "SPSCAN:",
-                            ".txt",
-                            save_as_binary=False,
-                        )
+                        else lambda: SaveFile(self.ctx).save_to_sd(spscan, "SPSCAN")
                     ),
                 ),
             ]
