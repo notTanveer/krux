@@ -86,6 +86,10 @@ jobs:
         run: uv sync --frozen --python ${{ matrix.py-version }}
       - name: Validate translations
         run: uv run --python ${{ matrix.py-version }} poe i18n validate
+      - name: Check baked translations match the json files
+        run: |
+          uv run --python ${{ matrix.py-version }} poe i18n-build
+          git diff --exit-code i18n/translations src/krux/translations
 
   run-tests:
     strategy:
