@@ -335,6 +335,7 @@ translation_array = [
     "Kurcalama Kontrol Kodu",
     "Kurcalama kontrol kodu başarıyla ayarlandı",
     "Kurcalama kontrol kodları eşleşmiyor",
+    "Taproot Adresi:",
     "Test Grubu:",
     "Test Paketi Sonuçları",
     "Test:",

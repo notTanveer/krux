@@ -335,6 +335,7 @@ translation_array = [
     "Sabotagecontrolecode",
     "Sabotagecontrolecode succesvol ingesteld",
     "Sabotagecontrolecodes komen niet overeen",
+    "Taproot-adres:",
     "testreeks",
     "Test Suite-resultaten",
     "Test:",

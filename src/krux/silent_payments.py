@@ -101,40 +101,20 @@ def validate_eligibility(policy):
         )
 
 
-def check_inputs_owned(psbt, root):
-    """Raises ValueError unless every BIP-352 eligible input belongs to root.
+def derive_scripts(psbt, root):
+    """Returns {output index: Script} for the PSBT's Silent Payment outputs.
 
-    This is the BIP32-only half of embit's derive_sp_outputs() ownership check,
-    so a PSBT this seed cannot sign is rejected while loading instead of after
-    the user has reviewed and approved it. No ECDH share or DLEQ proof is
-    computed here -- that happens once, inside sign_with().
+    Runs while loading, so the review screen can show the Taproot address each
+    SP output lands on and a PSBT this seed cannot sign is rejected before the
+    user reviews it: embit refuses it unless every BIP-352 eligible input
+    belongs to root and the BIP-375 checks pass (e.g. the Segwit v>1 input ban).
 
-    validate_sp() runs here too (e.g. BIP-375's Segwit v>1 input ban), so
-    those checks also reject at load instead of surfacing later, mid-sign.
+    Only the scripts are derived here. The DLEQ proofs, the expensive part,
+    are still computed once, inside sign_with().
     """
-    from embit.psbt import derive_hdkey, resolve_signing_root
-    from embit.silent_payments.psbt import SPValidationError
-    from embit.silent_payments.signing import resolve_input_privkey
-    from embit.silent_payments.sp import get_eligible_inputs
+    from embit.silent_payments.psbt import SPFieldError, SPValidationError
 
     try:
-        psbt.validate_sp()
-        eligible = get_eligible_inputs(psbt.inputs)
-    except SPValidationError as e:
+        return psbt.sp_output_scripts(root)
+    except (SPValidationError, SPFieldError) as e:
         raise ValueError(str(e))
-    if not eligible:
-        raise ValueError(
-            "Silent Payment send requires at least one eligible input "
-            "(P2PKH, P2SH-P2WPKH, P2WPKH, or P2TR)"
-        )
-
-    fingerprint, _, root = resolve_signing_root(root)
-    for i in eligible:
-        if (
-            resolve_input_privkey(psbt.inputs[i], root, fingerprint, derive_hdkey)
-            is None
-        ):
-            raise ValueError(
-                "Silent Payment signing failed: input %d is not controlled by "
-                "this seed; multi-party sends are not supported" % i
-            )

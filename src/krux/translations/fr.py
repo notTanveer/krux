@@ -335,6 +335,7 @@ translation_array = [
     "Code de non compromis",
     "Code de non compromis défini avec succès",
     "Les codes de non compromis ne correspondent pas",
+    "Adresse Taproot :",
     "Suite de Tests",
     "Résultats de la suite de tests",
     "Test:",

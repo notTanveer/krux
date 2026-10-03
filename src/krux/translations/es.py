@@ -335,6 +335,7 @@ translation_array = [
     "Código de verificación",
     "Código de verificación establecido con éxito",
     "Los códigos de verificación no coinciden",
+    "Dirección Taproot:",
     "Suite de Pruebas",
     "Resultados de la suite de pruebas",
     "Prueba:",

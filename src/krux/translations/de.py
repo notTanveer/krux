@@ -335,6 +335,7 @@ translation_array = [
     "Tamper Check Code",
     "Tamper Check Code erfolgreich gesetzt",
     "Tamper Check Codes stimmen nicht überein",
+    "Taproot-Adresse:",
     "Test-Suite",
     "Ergebnisse der Testsuite",
     "Test:",

@@ -1328,8 +1328,9 @@ def test_sp_send_derives_outputs_only_once(mocker, m5stickv):
 
     wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
     signer = PSBTSigner(wallet, psbt_b64, FORMAT_NONE)
-    # Loading must not derive: it only checks eligibility and ownership.
+    # Loading derives the scripts for review only: no share or proof yet.
     assert spy.call_count == 0
+    assert not signer.psbt.sp_dleq_proofs
 
     signer.outputs()
     assert spy.call_count == 0
@@ -1391,3 +1392,70 @@ def test_sp_send_hands_back_fully_unfinalized_psbt(mocker, m5stickv):
     signer.sign(trim=False)
 
     _assert_not_finalized(signer.psbt)
+
+
+def test_review_shows_derived_taproot_address(mocker, m5stickv):
+    """Each SP output is followed by a page with the taproot address it lands
+    on, and that is the address that gets signed."""
+    from embit.networks import NETWORKS
+    from krux.format import format_address
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    psbt_b64, _root, _scan, _spend, _child = _build_sp_psbt()
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+    signer = PSBTSigner(wallet, psbt_b64, FORMAT_NONE)
+
+    messages, _ = signer.outputs()
+
+    expected = Script(bytes.fromhex(_expected_output_script())).address(
+        NETWORKS["test"]
+    )
+    # summary, the sp address page, then its taproot address page
+    assert len(messages) == 3
+    assert "tsp1" in messages[1].replace(" ", "")
+    assert messages[2].startswith("1. Taproot address:")
+    assert format_address(expected) in messages[2]
+
+    signer.sign(trim=False)
+    assert signer.psbt.outputs[0].script_pubkey.address(NETWORKS["test"]) == expected
+
+
+def test_sign_refuses_sp_output_changed_after_review(mocker, m5stickv):
+    """The script signed must be the one that was shown for review."""
+    from embit.networks import NETWORKS
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    psbt_b64, _root, scan_pub, _spend, _child = _build_sp_psbt()
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+    signer = PSBTSigner(wallet, psbt_b64, FORMAT_NONE)
+    signer.outputs()
+
+    other_spend = ec.PrivateKey(bytes([9] * 32)).get_public_key()
+    signer.psbt.outputs[0].sp_data = SilentPaymentData(scan_pub, other_spend)
+
+    with pytest.raises(ValueError, match="changed after review"):
+        signer.sign(trim=False)
+
+
+def test_sp_send_with_foreign_input_rejected_at_load(mocker, m5stickv):
+    """A PSBT this seed cannot sign is refused before the user reviews it."""
+    from embit.networks import NETWORKS
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    psbt_b64, _root, _scan, _spend, _child = _build_sp_psbt()
+    other_mnemonic = (
+        "legal winner thank year wave sausage worth useful legal winner thank yellow"
+    )
+    wallet = Wallet(Key(other_mnemonic, TYPE_SINGLESIG, NETWORKS["test"]))
+
+    with pytest.raises(ValueError, match="controlled by this seed"):
+        PSBTSigner(wallet, psbt_b64, FORMAT_NONE)

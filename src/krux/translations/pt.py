@@ -335,6 +335,7 @@ translation_array = [
     "Código de verificação de integridade",
     "Código de verificação de integridade definido com sucesso",
     "Os códigos de verificação de integridade não correspondem",
+    "Endereço Taproot:",
     "Suíte de testes",
     "Resultados da suíte de testes",
     "Teste:",

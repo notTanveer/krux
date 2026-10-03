@@ -73,6 +73,7 @@ class PSBTSigner:
         self.zero_fingerprints_filled = None
         self._has_sp = False
         self._sp_keys = None
+        self._sp_scripts = {}
 
         # Parse the PSBT
         if psbt_filename:
@@ -219,17 +220,17 @@ class PSBTSigner:
 
         self._has_sp = self.psbt.has_sp_outputs
         if self._has_sp:
-            from .silent_payments import check_inputs_owned, validate_eligibility
+            from .silent_payments import derive_scripts, validate_eligibility
 
             validate_eligibility(self.policy)
             # embit matches derivations by fingerprint, so a PSBT exported by an
             # xpub-only wallet looks foreign until the zeroes are repaired. The
             # review screen still reports the repair (the call is memoized).
             self.fill_zero_fingerprint()
-            # Ownership is checked here (BIP32 only) so an unsignable PSBT is
-            # rejected before the user reviews it. The SP output derivation --
-            # ECDH shares plus DLEQ proofs -- runs once, inside sign_with().
-            check_inputs_owned(self.psbt, self.wallet.key.root)
+            # Derived here so an unsignable PSBT is rejected before the user
+            # reviews it, and the review can show the Taproot address of each
+            # SP output. The DLEQ proofs still run once, inside sign_with().
+            self._sp_scripts = derive_scripts(self.psbt, self.wallet.key.root)
             # Cached because _classify_output needs it per SP output, and each
             # call is two 5-level hardened BIP32 derivations.
             self._sp_keys = self.wallet.key.sp_detection_keys()
@@ -398,7 +399,20 @@ class PSBTSigner:
                 (("%d. " + title + " \n\n%s\n\n") % (i + 1, format_address(out[0])))
                 + self._btc_render(out[1], prefix="")
             )
+            if out[2] is not None:
+                # SP output: a second page with the address it lands on
+                message_seq.append(
+                    ("%d. " + t("Taproot address:") + "\n\n%s")
+                    % (i + 1, format_address(out[2]))
+                )
         return message_seq
+
+    def _taproot_address(self, index):
+        """Returns the Taproot address an SP output lands on, else None"""
+        script = self._sp_scripts.get(index)
+        if script is None:
+            return None
+        return script.address(network=self.wallet.key.network)
 
     def outputs(self):
         """Returns a list of messages describing where amounts are going"""
@@ -453,19 +467,21 @@ class PSBTSigner:
                 output_policy_count[out_policy["type"]] += 1
                 output_type = self._classify_output(out_policy, out)
 
-            address = output_address(
-                out, vout[i].script_pubkey, self.wallet.key.network
-            )
             value = vout[i].value
+            output = (
+                output_address(out, vout[i].script_pubkey, self.wallet.key.network),
+                value,
+                self._taproot_address(i),
+            )
 
             if output_type == CHANGE:
-                change_list.append((address, value))
+                change_list.append(output)
                 change_amount += value
             elif output_type == SELF_TRANSFER:
-                self_transfer_list.append((address, value))
+                self_transfer_list.append(output)
                 self_amount += value
             else:  # Address is from other wallet
-                spend_list.append((address, value))
+                spend_list.append(output)
                 spend_amount += value
 
         if len(spend_list) > 0:
@@ -625,6 +641,11 @@ class PSBTSigner:
             raise ValueError(str(e))
 
         if has_sp:
+            # What gets signed must be what was shown for review.
+            for i, script in self._sp_scripts.items():
+                if self.psbt.outputs[i].script_pubkey != script:
+                    raise ValueError("output %d changed after review" % i)
+
             # BIP-375: the Signer must hand back an unfinalized PSBT so the
             # coordinator can verify the derived Silent Payment outputs before
             # finalizing. embit finalizes taproot key-path inputs on signing,

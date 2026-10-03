@@ -335,6 +335,7 @@ translation_array = [
     "Mã kiểm tra giả mạo",
     "Đã đặt mã kiểm tra giả mạo thành công",
     "Mã kiểm tra giả mạo không khớp",
+    "Địa chỉ Taproot:",
     "Bộ thử nghiệm",
     "Kết quả bộ thử nghiệm",
     "Kiểm tra bài cũ:",
