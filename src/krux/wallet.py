@@ -77,9 +77,7 @@ class Wallet:
             self.label = t("Single-sig")
             self.policy = {"type": self.get_scriptpubkey_type()}
         elif self.key and self.key.policy_type == TYPE_SILENT_PAYMENT:
-            self.descriptor = SilentPaymentDescriptor(
-                sp_key=self.key.sp_scan_key(self.which_network())
-            )
+            # SP wallets have no output descriptor, so descriptor stays None
             self.label = t("Single-sig SP")
             self.policy = {"type": P2TR}
 
@@ -150,9 +148,6 @@ class Wallet:
 
     def _determine_descriptor_policy(self, descriptor):
         """Returns required policy type and script type from descriptor"""
-        if isinstance(descriptor, SilentPaymentDescriptor):
-            return TYPE_SILENT_PAYMENT, P2TR
-
         descriptor_is_multisig = descriptor.is_basic_multisig
         descriptor_is_miniscript = not descriptor_is_multisig and (
             descriptor.miniscript is not None or descriptor.taptree
@@ -192,8 +187,6 @@ class Wallet:
 
     def _validate_xpub_match(self, descriptor, descriptor_xpubs):
         """Validates that key's xpub matches the descriptor"""
-        if self.is_silent_payment():
-            return  # SP wallets use scan key, not xpub
         if self.is_multisig():
             if not descriptor.is_basic_multisig:
                 raise ValueError("not multisig")
@@ -249,6 +242,9 @@ class Wallet:
         if self.is_silent_payment():
             raise ValueError("SP wallets do not load external descriptors")
         descriptor, label = parse_wallet(wallet_data)
+        if isinstance(descriptor, SilentPaymentDescriptor):
+            # Has no xpubs to check, and an SP wallet would refuse it anyway
+            raise ValueError("Silent Payment descriptors are not supported")
 
         # convert descriptor keys to 'xpub' on same network -- for comparison only
         descriptor_xpubs = []
@@ -332,11 +328,6 @@ class Wallet:
     def obtain_addresses(self, i=0, limit=None, branch_index=0):
         """Returns an iterator deriving addresses (default branch_index is receive)
         for the wallet up to the provided limit"""
-
-        if self.is_silent_payment():
-            if i == 0:
-                yield self.obtain_sp_address()
-            return
 
         if self.descriptor is None:
             raise ValueError("No descriptor to derive addresses from")

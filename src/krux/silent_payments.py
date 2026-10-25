@@ -23,38 +23,43 @@ from .key import P2PKH, P2SH_P2WPKH, P2TR, P2WPKH
 
 
 def own_sp_output_type(out, sp_keys):
-    """Returns "change", "self", or None for an SP output vs the wallet's keys."""
+    """Returns "change", "self", or None for an SP output vs the wallet's keys.
+
+    Only the unlabeled address and the BIP-352 change label 0 count as ours.
+    A scanning wallet checks just the labels it handed out, so an output with
+    any other label may never be found and is reviewed as a spend instead.
+    """
     if sp_keys is None:
         return None
 
     sp_data = out.sp_data
-    if sp_data.scan_key != sp_keys.scan_privkey.get_public_key():
+    if sp_data.scan_key != sp_keys.scan_pubkey:
         return None
 
     label = out.sp_label
     if label is None:
         expected_spend = sp_keys.spend_pubkey
-    else:
+    elif label == 0:
         from embit.silent_payments.sp import apply_label
 
-        expected_spend = apply_label(sp_keys.spend_pubkey, sp_keys.scan_privkey, label)
+        expected_spend = apply_label(sp_keys.spend_pubkey, sp_keys.scan_privkey, 0)
+    else:
+        return None
 
     if sp_data.spend_key != expected_spend:
         return None
-    return "change" if label == 0 else "self"
+    return "self" if label is None else "change"
 
 
-def output_address(out, script_pubkey, network):
+def output_address(out, script_pubkey, wallet):
     """Returns the human-readable destination address for a PSBT output."""
     if out.sp_data is not None:
         from embit.silent_payments.sp import encode_silent_payment_address
 
-        # encode_silent_payment_address only distinguishes "main" from the rest
-        net_name = "main" if network.get("bech32") == "bc" else "test"
         return encode_silent_payment_address(
-            out.sp_data.scan_key, out.sp_data.spend_key, network=net_name
+            out.sp_data.scan_key, out.sp_data.spend_key, wallet.which_network()
         )
-    return script_pubkey.address(network=network)
+    return script_pubkey.address(network=wallet.key.network)
 
 
 def validate(psbt):
@@ -63,11 +68,9 @@ def validate(psbt):
     Krux acts as the BIP-375 Signer: it hands back an unfinalized PSBT carrying
     the derived Taproot output scripts plus the global ECDH shares and DLEQ
     proofs, so the coordinator can verify the outputs before finalizing.
+    Inputs are not checked here: sign() clears the ones this seed owns, and
+    an input another signer finalized is left as it came.
     """
-    for i, inp in enumerate(psbt.inputs):
-        if inp.final_scriptwitness is not None or inp.final_scriptsig is not None:
-            raise ValueError("input %d must not be finalized" % i)
-
     for i, out in enumerate(psbt.outputs):
         if out.sp_data is None:
             continue

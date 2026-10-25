@@ -1111,3 +1111,32 @@ def test_change_to_silent_payment_policy(m5stickv, mocker, tdata):
     assert script_type == P2TR
     assert derivation_path == "m/352h/0h/0h"
     assert ctx.input.wait_for_button.call_count == len(BTN_SEQUENCE)
+
+
+def test_change_from_silent_payment_asks_script_type(m5stickv, mocker, tdata):
+    from krux.pages.wallet_settings import WalletSettings
+    from krux.wallet import Wallet
+    from krux.key import TYPE_SINGLESIG, P2WPKH
+    from krux.pages import BUTTON_ENTER, BUTTON_PAGE, BUTTON_PAGE_PREV
+
+    BTN_SEQUENCE = [
+        BUTTON_PAGE,  # Go to "Policy Type"
+        BUTTON_ENTER,  # Enter "Policy Type"
+        BUTTON_ENTER,  # Pick Single-sig
+        *([BUTTON_PAGE] * 2),  # Script type is asked again, go to Native Segwit
+        BUTTON_ENTER,  # Confirm Native Segwit
+        BUTTON_PAGE_PREV,  # Go to Back
+        BUTTON_ENTER,  # Leave
+    ]
+
+    ctx = create_ctx(mocker, BTN_SEQUENCE, Wallet(tdata.SILENT_PAYMENT_KEY))
+    wallet_settings = WalletSettings(ctx)
+    _, policy_type, script_type, _, derivation_path = wallet_settings.customize_wallet(
+        ctx.wallet.key
+    )
+
+    # SP forced P2TR, so leaving it must not keep Taproot without asking
+    assert policy_type == TYPE_SINGLESIG
+    assert script_type == P2WPKH
+    assert derivation_path == "m/84h/1h/0h"
+    assert ctx.input.wait_for_button.call_count == len(BTN_SEQUENCE)

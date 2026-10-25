@@ -1593,6 +1593,7 @@ def test_sign_cancel_zeroes_fingerprint(mocker, m5stickv, tdata):
 
     btn_seq = [
         BUTTON_ENTER,  # Load from QR code
+        BUTTON_ENTER,  # Confirm path mismatch, seen once the fingerprint is repaired
         BUTTON_PAGE,  # Cancel fingerprint missing
     ]
     wallet = Wallet(tdata.SINGLESIG_SIGNING_KEY)
@@ -1630,6 +1631,7 @@ def test_sign_zeroes_fingerprint(mocker, m5stickv, tdata):
 
     btn_seq = [
         BUTTON_ENTER,  # Load from QR code
+        BUTTON_ENTER,  # Confirm path mismatch, seen once the fingerprint is repaired
         BUTTON_ENTER,  # Confirm fingerprint missing
         BUTTON_ENTER,  # PSBT resume
         BUTTON_ENTER,  # output 1

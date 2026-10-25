@@ -102,7 +102,8 @@ class SaveFile(Page):
         return persisted
 
     def save_to_sd(self, data, name, file_extension=".txt"):
-        """Save data to SD card with given name and extension, no prompt."""
+        """Save data to SD card as text, skipping the "Save to SD card?" prompt.
+        The user still confirms or edits the filename."""
         self.save_file(
             data,
             name,

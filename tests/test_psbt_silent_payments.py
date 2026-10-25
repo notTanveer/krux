@@ -24,6 +24,11 @@ SPEND_HEX = "0361e1b1e9de5e42cb2007f7ca54b9e0d57ed13938fad56d3f19e57513a8fce039"
 INPUT_PATH = [84 + 2**31, 1 + 2**31, 0 + 2**31, 0, 0]
 
 
+def _spend_privkey(key):
+    """The wallet's BIP-352 spend private key, which Key does not keep"""
+    return key.root.derive(key.derivation + "/0h/0").key
+
+
 def _normalize_xonly_keys(items):
     """Normalizes (secret, is_xonly) pairs to the scalars BIP-352 sums.
 
@@ -126,7 +131,7 @@ def test_sign_silent_payment_output(mocker, m5stickv):
     wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
     signer = PSBTSigner(wallet, psbt_b64, FORMAT_NONE)
 
-    assert signer.has_sp_outputs()
+    assert signer.psbt.has_sp_outputs
 
     signer.sign(trim=False)
 
@@ -355,7 +360,7 @@ def _build_sp_spend_psbt(wallet):
     P_k = B_spend + tweak*G, and the PSBT carries the per-input ``sp_tweak`` plus
     ``sp_spend_bip32_derivations`` pointing at the wallet's m/352h/.../0h/0 spend
     key. The single destination output is an ordinary P2WPKH (no SP data), so
-    has_sp_outputs() is False and only the BIP-376 spend path is exercised.
+    has_sp_outputs is False and only the BIP-376 spend path is exercised.
     """
     from embit import script
     from embit.psbt import DerivationPath
@@ -367,7 +372,7 @@ def _build_sp_spend_psbt(wallet):
 
     key = wallet.key
     root = key.root
-    spend_priv = key.sp_keys.spend_privkey
+    spend_priv = _spend_privkey(key)
     spend_pub = key.sp_keys.spend_pubkey
 
     # Full path from the master to the spend key, as a coordinator would record
@@ -423,7 +428,7 @@ def test_sign_spend_from_sp(mocker, m5stickv):
     # --- WORKS: load + policy. The SP-spend input is recognized as p2tr, and
     # this is a spend-FROM so there are no SP *outputs*. ---
     assert signer.policy["type"] == P2TR
-    assert not signer.has_sp_outputs()
+    assert not signer.psbt.has_sp_outputs
 
     # --- WORKS: the review screen the sign UI shows reports correct amounts. ---
     out_strs, fee_percent = signer.outputs()
@@ -439,7 +444,7 @@ def test_sign_spend_from_sp(mocker, m5stickv):
     msg = signer.psbt.sighash(0, sighash=0)  # SIGHASH_DEFAULT
     pubkey = ec.PublicKey.from_xonly(output_xonly)
     assert pubkey.schnorr_verify(ec.SchnorrSig(sig), msg)
-    expected_key = wallet.key.sp_keys.spend_privkey.sp_spend_tweak(SP_SPEND_TWEAK)
+    expected_key = _spend_privkey(wallet.key).sp_spend_tweak(SP_SPEND_TWEAK)
     assert output_xonly == expected_key.xonly()
 
     # --- WORKS: production trim/export round-trips as v2 and keeps the sig. ---
@@ -512,7 +517,7 @@ def test_spend_from_sp_foreign_tweak_refused(mocker, m5stickv):
     spend_pub = key.sp_keys.spend_pubkey
 
     # On-chain key commits to one tweak; the PSBT carries a different one.
-    output_xonly = key.sp_keys.spend_privkey.sp_spend_tweak(bytes([0x11] * 32)).xonly()
+    output_xonly = _spend_privkey(key).sp_spend_tweak(bytes([0x11] * 32)).xonly()
     derivation = (
         spend_pub.sec(),
         DerivationPath(root.my_fingerprint, parse_path(key.derivation + "/0h/0")),
@@ -551,7 +556,7 @@ def test_spend_from_sp_foreign_derivation_refused(mocker, m5stickv):
     spend_pub = key.sp_keys.spend_pubkey
 
     sp_tweak = bytes([0x11] * 32)
-    output_xonly = key.sp_keys.spend_privkey.sp_spend_tweak(sp_tweak).xonly()
+    output_xonly = _spend_privkey(key).sp_spend_tweak(sp_tweak).xonly()
     # Correct path, but a fingerprint that is not this wallet's master.
     derivation = (
         spend_pub.sec(),
@@ -593,7 +598,7 @@ def test_sign_spend_from_sp_with_normal_taproot_input(mocker, m5stickv):
     root = key.root
 
     sp_tweak = bytes([0x11] * 32)
-    output_xonly = key.sp_keys.spend_privkey.sp_spend_tweak(sp_tweak).xonly()
+    output_xonly = _spend_privkey(key).sp_spend_tweak(sp_tweak).xonly()
     sp_derivation = (
         key.sp_keys.spend_pubkey.sec(),
         DerivationPath(root.my_fingerprint, parse_path(key.derivation + "/0h/0")),
@@ -624,7 +629,7 @@ def test_sign_spend_from_sp_with_normal_taproot_input(mocker, m5stickv):
 
     signer = PSBTSigner(wallet, psbt.to_string(), FORMAT_NONE)
     assert signer.policy["type"] == P2TR
-    assert not signer.has_sp_outputs()
+    assert not signer.psbt.has_sp_outputs
 
     signer.sign(trim=False)
 
@@ -726,7 +731,7 @@ def test_sign_sp_output_from_taproot_input(mocker, m5stickv):
 
     wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
     signer = PSBTSigner(wallet, psbt_b64, FORMAT_NONE)
-    assert signer.has_sp_outputs()
+    assert signer.psbt.has_sp_outputs
     signer.sign(trim=False)
 
     assert signer.psbt.outputs[
@@ -848,7 +853,7 @@ def test_self_transfer_sp_to_sp(mocker, m5stickv):
     wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, NETWORKS["test"]))
     key = wallet.key
     root = key.root
-    spend_priv = key.sp_keys.spend_privkey
+    spend_priv = _spend_privkey(key)
     spend_pub = key.sp_keys.spend_pubkey
 
     # Pick a tweak whose tweaked spend key has odd Y, to exercise the negation.
@@ -892,7 +897,7 @@ def test_self_transfer_sp_to_sp(mocker, m5stickv):
     psbt.tx_modifiable_flags = 0
 
     signer = PSBTSigner(wallet, psbt.to_string(), FORMAT_NONE)
-    assert signer.has_sp_outputs()
+    assert signer.psbt.has_sp_outputs
     assert signer.policy["type"] == P2TR
     signer.sign(trim=False)
 
@@ -996,15 +1001,14 @@ def test_sign_interleaved_sp_outputs_same_scan_key(mocker, m5stickv):
     assert len(set(on_chain)) == 3
 
 
-def _labeled_spend_pub(sp_keys, label):
+def _labeled_spend_pub(key, label):
     """Independently derive the wallet's BIP-352 labeled spend pubkey via
     private-key arithmetic: (b_spend + hash(b_scan || m)) · G."""
     tweak = tagged_hash(
-        "BIP0352/Label", sp_keys.scan_privkey.secret + label.to_bytes(4, "big")
+        "BIP0352/Label", key.sp_keys.scan_privkey.secret + label.to_bytes(4, "big")
     )
     scalar = (
-        int.from_bytes(sp_keys.spend_privkey.secret, "big")
-        + int.from_bytes(tweak, "big")
+        int.from_bytes(_spend_privkey(key).secret, "big") + int.from_bytes(tweak, "big")
     ) % SECP256K1_ORDER
     return ec.PrivateKey(scalar.to_bytes(32, "big")).get_public_key()
 
@@ -1031,17 +1035,19 @@ def test_own_sp_output_type_classification(mocker, m5stickv):
     # Label 0 is the BIP-352 change label.
     assert (
         own_sp_output_type(
-            out_with(scan_pub, _labeled_spend_pub(sp_keys, 0), label=0), sp_keys
+            out_with(scan_pub, _labeled_spend_pub(key, 0), label=0), sp_keys
         )
         == "change"
     )
-    # Other labels are our own labeled receive addresses.
-    assert (
-        own_sp_output_type(
-            out_with(scan_pub, _labeled_spend_pub(sp_keys, 1), label=1), sp_keys
+    # Any other label may never be scanned for, so it is reviewed as a spend.
+    for label in (1, 0xFFFFFFF0):
+        assert (
+            own_sp_output_type(
+                out_with(scan_pub, _labeled_spend_pub(key, label), label=label),
+                sp_keys,
+            )
+            is None
         )
-        == "self"
-    )
 
     foreign_scan = ec.PublicKey.parse(bytes.fromhex(SCAN_HEX))
     foreign_spend = ec.PublicKey.parse(bytes.fromhex(SPEND_HEX))
@@ -1056,7 +1062,7 @@ def test_own_sp_output_type_classification(mocker, m5stickv):
     # A label claim that does not match the tweaked spend key is not ours.
     assert (
         own_sp_output_type(
-            out_with(scan_pub, _labeled_spend_pub(sp_keys, 2), label=1), sp_keys
+            out_with(scan_pub, _labeled_spend_pub(key, 2), label=1), sp_keys
         )
         is None
     )
@@ -1081,7 +1087,7 @@ def test_sp_change_classified_as_change(mocker, m5stickv):
     wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, NETWORKS["test"]))
     key = wallet.key
     root = key.root
-    spend_priv = key.sp_keys.spend_privkey
+    spend_priv = _spend_privkey(key)
     spend_pub = key.sp_keys.spend_pubkey
     own_scan_pub = key.sp_keys.scan_privkey.get_public_key()
 
@@ -1117,7 +1123,7 @@ def test_sp_change_classified_as_change(mocker, m5stickv):
     change = SPOutputScope()
     change.value = 35_000
     change.script_pubkey = None
-    change.sp_data = SilentPaymentData(own_scan_pub, _labeled_spend_pub(key.sp_keys, 0))
+    change.sp_data = SilentPaymentData(own_scan_pub, _labeled_spend_pub(key, 0))
     change.sp_label = 0
     psbt.add_output(change)
 
@@ -1137,39 +1143,19 @@ def test_sp_change_classified_as_change(mocker, m5stickv):
     assert signer.psbt.inputs[0].taproot_key_sig is not None
 
 
-def test_sp_detection_keys_match_sp_wallet(mocker, m5stickv):
-    """A non-SP wallet derives the same BIP-352 keys an SP wallet would.
-
-    SP scan/spend keys are deterministic from the seed, so detection works
-    regardless of the loaded policy type.
-    """
-    from krux.key import Key, TYPE_SINGLESIG, TYPE_SILENT_PAYMENT
-
-    sp_key = Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, NETWORKS["test"])
-    ss_key = Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"])
-
-    assert ss_key.sp_keys is None
-    detected = ss_key.sp_detection_keys()
-    assert detected.scan_privkey.secret == sp_key.sp_keys.scan_privkey.secret
-    assert detected.spend_pubkey.sec() == sp_key.sp_keys.spend_pubkey.sec()
-    # The SP wallet returns its own keys unchanged.
-    assert sp_key.sp_detection_keys() is sp_key.sp_keys
-
-
-def test_sp_change_detected_when_loaded_as_singlesig(mocker, m5stickv):
-    """Own SP change is recognized even when the wallet is loaded as plain
-    single-sig instead of Silent Payments: the SP keys are derived from the
-    seed, so the label-0 change output is grouped under self-transfer/change
-    rather than inflating the spend total.
+def test_sp_change_is_a_spend_when_loaded_as_singlesig(mocker, m5stickv):
+    """A plain single-sig watch-only wallet never scans for silent payments,
+    so an output to the seed's own SP address is reviewed as a spend, with the
+    SP warning, not hidden as change.
     """
     from krux.psbt import PSBTSigner
     from krux.key import Key, TYPE_SINGLESIG, TYPE_SILENT_PAYMENT
     from krux.wallet import Wallet
     from krux.qr import FORMAT_NONE
 
-    # SP keys for building the own-change output: same seed, so the single-sig
-    # wallet derives these same keys on the fly for detection.
-    sp_keys = Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, NETWORKS["test"]).sp_keys
+    # SP keys for building the own-change output, from the same seed
+    sp_key = Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, NETWORKS["test"])
+    sp_keys = sp_key.sp_keys
     own_scan_pub = sp_keys.scan_privkey.get_public_key()
 
     root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(TEST_MNEMONIC))
@@ -1200,7 +1186,7 @@ def test_sp_change_detected_when_loaded_as_singlesig(mocker, m5stickv):
     change = SPOutputScope()
     change.value = 35_000
     change.script_pubkey = None
-    change.sp_data = SilentPaymentData(own_scan_pub, _labeled_spend_pub(sp_keys, 0))
+    change.sp_data = SilentPaymentData(own_scan_pub, _labeled_spend_pub(sp_key, 0))
     change.sp_label = 0
     psbt.add_output(change)
 
@@ -1211,8 +1197,8 @@ def test_sp_change_detected_when_loaded_as_singlesig(mocker, m5stickv):
     signer = PSBTSigner(wallet, psbt.to_string(), FORMAT_NONE)
     messages, _ = signer.outputs()
 
-    assert "Spend (1):" in messages[0]
-    assert "Self-transfer or Change (1):" in messages[0]
+    assert "Spend (2):" in messages[0]
+    assert signer.has_sp_spend()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1233,7 +1219,7 @@ def _sp_wallet_spend_psbt_with_p2tr_dest(wallet):
     from embit.silent_payments.psbt import SPOutputScope
 
     key = wallet.key
-    spend_priv = key.sp_keys.spend_privkey
+    spend_priv = _spend_privkey(key)
     spend_pub = key.sp_keys.spend_pubkey
 
     psbt = SilentPaymentsPSBT.create_v2()
@@ -1339,43 +1325,13 @@ def test_sp_send_derives_outputs_only_once(mocker, m5stickv):
     assert spy.call_count == 1
 
 
-def test_sp_detection_keys_derived_once_for_many_outputs(mocker, m5stickv):
-    """Own-output detection keys are cached, not re-derived per SP output.
-
-    Each derivation is two 5-level hardened BIP32 paths; doing it per output
-    scaled that cost linearly with the number of SP outputs.
-    """
-    from embit.networks import NETWORKS
-    from krux.key import Key, TYPE_SINGLESIG
-    from krux.psbt import PSBTSigner
-    from krux.wallet import Wallet
-    from krux.qr import FORMAT_NONE
-
-    spend_pubs = [
-        bip32.HDKey.from_seed(bip39.mnemonic_to_seed(TEST_MNEMONIC))
-        .derive([7 + 2**31, i + 2**31, 0])
-        .get_public_key()
-        for i in range(3)
-    ]
-    psbt_b64 = _build_sp_psbt_spend_list(spend_pubs)
-
-    spy = mocker.spy(Key, "sp_detection_keys")
-    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
-    signer = PSBTSigner(wallet, psbt_b64, FORMAT_NONE)
-    out_strs, _ = signer.outputs()
-
-    assert len(signer.psbt.outputs) == 3
-    assert spy.call_count == 1
-    assert any("Spend (3):" in s for s in out_strs)
-
-
 def test_sp_send_hands_back_fully_unfinalized_psbt(mocker, m5stickv):
-    """BIP-375: no input may be left finalized, even one that arrived that way.
+    """BIP-375: no input of ours may be left finalized, even one that arrived
+    that way.
 
     embit finalizes taproot key-path inputs on signing, which makes coordinators
     copy only the witnesses and drop the derived SP fields. Krux clears every
-    input -- safe because derive_sp_outputs refuses the PSBT unless all eligible
-    inputs belong to this seed, so there is no foreign witness to destroy.
+    BIP-352 eligible input, which loading already checked are all this seed's.
     """
     from embit.networks import NETWORKS
     from embit.script import Witness
@@ -1459,3 +1415,241 @@ def test_sp_send_with_foreign_input_rejected_at_load(mocker, m5stickv):
 
     with pytest.raises(ValueError, match="controlled by this seed"):
         PSBTSigner(wallet, psbt_b64, FORMAT_NONE)
+
+
+def test_sd_load_falls_back_when_validate_runs_out_of_ram(mocker, m5stickv, tmp_path):
+    """A PSBT that parses but runs out of RAM in validate() is re-read in the
+    lighter compressed mode, which keeps the BIP-375 fields."""
+    import base64
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    (tmp_path / "sp.psbt").write_bytes(base64.b64decode(_build_sp_psbt()[0]))
+    mocker.patch("krux.settings.SD_PATH", str(tmp_path).lstrip("/"))
+    real_validate = PSBTSigner.validate
+    calls = []
+
+    def validate(self):
+        calls.append(self.psbt)
+        if len(calls) == 1:
+            raise MemoryError("memory allocation failed")
+        real_validate(self)
+
+    mocker.patch.object(PSBTSigner, "validate", validate)
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+    signer = PSBTSigner(wallet, None, FORMAT_NONE, psbt_filename="sp.psbt")
+
+    assert len(calls) == 2 and calls[0] is not calls[1]
+    assert signer.has_sp_spend()
+    signer.sign(trim=False)
+    assert signer.psbt.outputs[0].script_pubkey.data.hex() == _expected_output_script()
+
+
+def test_sp_send_keeps_other_signers_finalized_input(mocker, m5stickv):
+    """A script path input with the NUMS internal key is not BIP-352 eligible,
+    so it is not ours. If it arrives finalized, its witness must survive."""
+    from embit.script import Witness
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    psbt = SilentPaymentsPSBT.from_string(_build_sp_psbt_taproot_input()[0])
+    merkle_root = bytes([0x42] * 32)
+    output_key = ec.NUMS_PUBKEY.taproot_tweak(merkle_root)
+    inp = SPInputScope()
+    inp.txid = bytes([0xEF] * 32)
+    inp.vout = 1
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(
+        value=50_000, script_pubkey=Script(b"\x51\x20" + output_key.xonly())
+    )
+    inp.taproot_internal_key = ec.NUMS_PUBKEY
+    inp.taproot_merkle_root = merkle_root
+    witness = Witness([b"\x01" * 64, b"\x51", b"\xc0" + ec.NUMS_PUBKEY.xonly()])
+    inp.final_scriptwitness = witness
+    psbt.tx_modifiable_flags = 3
+    psbt.add_input(inp)
+    psbt.tx_modifiable_flags = 0
+
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+    signer = PSBTSigner(wallet, psbt.to_string(), FORMAT_NONE)
+    signer.sign(trim=False)
+
+    assert signer.psbt.inputs[0].taproot_key_sig is not None
+    assert signer.psbt.inputs[0].final_scriptwitness is None
+    assert signer.psbt.inputs[1].final_scriptwitness == witness
+
+
+def test_sp_aux_rand_streams_the_psbt(mocker, m5stickv):
+    """The aux_rand hash streams the PSBT instead of serializing a copy."""
+    import hashlib
+    from krux.psbt import PSBTSigner, _HashWriter
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+    signer = PSBTSigner(wallet, _build_sp_psbt()[0], FORMAT_NONE)
+
+    h = hashlib.sha256()
+    signer.psbt.write_to(_HashWriter(h))
+    assert h.digest() == hashlib.sha256(signer.psbt.serialize()).digest()
+
+    spy = mocker.spy(signer.psbt, "serialize")
+    signer.sign(trim=False)
+    assert spy.call_count == 0
+
+
+def test_has_sp_spend_ignores_own_sp_change(mocker, m5stickv):
+    """The verify-with-recipient warning is only for SP outputs that pay
+    someone else, not for the wallet's own SP change."""
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG, TYPE_SILENT_PAYMENT
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+    psbt_b64 = _build_sp_psbt()[0]
+    assert PSBTSigner(wallet, psbt_b64, FORMAT_NONE).has_sp_spend()
+
+    sp_key = Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, NETWORKS["test"])
+    psbt = SilentPaymentsPSBT.from_string(psbt_b64)
+    psbt.outputs[0].sp_data = SilentPaymentData(
+        sp_key.sp_keys.scan_pubkey, _labeled_spend_pub(sp_key, 0)
+    )
+    psbt.outputs[0].sp_label = 0
+    assert PSBTSigner(wallet, psbt.to_string(), FORMAT_NONE).has_sp_spend()
+    signer = PSBTSigner(Wallet(sp_key), psbt.to_string(), FORMAT_NONE)
+    assert not signer.has_sp_spend()
+
+
+def test_path_mismatch_checks_sp_spend_derivations(mocker, m5stickv):
+    """A BIP-376 spend from another SP account gets the path mismatch warning."""
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SILENT_PAYMENT
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    net = NETWORKS["test"]
+    acct0 = Wallet(Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, net))
+    acct5 = Wallet(Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, net, account_index=5))
+
+    signer = PSBTSigner(acct0, _build_sp_spend_psbt(acct0), FORMAT_NONE)
+    assert signer.path_mismatch() == ""
+
+    signer = PSBTSigner(acct0, _build_sp_spend_psbt(acct5), FORMAT_NONE)
+    assert "352h/1h/5h" in signer.path_mismatch()
+
+
+def test_fill_zero_fingerprint_repairs_sp_spend_derivation(mocker, m5stickv):
+    """A BIP-376 spend exported without the master fingerprint is repaired, so
+    the SP-spend input still gets signed."""
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SILENT_PAYMENT
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SILENT_PAYMENT, NETWORKS["test"]))
+    psbt = SilentPaymentsPSBT.from_string(_build_sp_spend_psbt(wallet))
+    for der in psbt.inputs[0].sp_spend_bip32_derivations.values():
+        der.fingerprint = b"\x00\x00\x00\x00"
+
+    signer = PSBTSigner(wallet, psbt.to_string(), FORMAT_NONE)
+    assert signer.zero_fingerprints_filled == 1
+    signer.sign(trim=False)
+    assert signer.psbt.inputs[0].taproot_key_sig is not None
+
+
+def test_fill_zero_fingerprint_repairs_odd_y_taproot_key(mocker, m5stickv):
+    """Taproot derivations carry x-only keys, parsed back with an even y, so an
+    input key with an odd y must still be matched and repaired."""
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(TEST_MNEMONIC))
+    path = next(
+        TAP_PATH[:-1] + [i]
+        for i in range(20)
+        if root.derive(TAP_PATH[:-1] + [i]).get_public_key().sec()[0] == 3
+    )
+    psbt = SilentPaymentsPSBT.from_string(_build_sp_psbt_taproot_input()[0])
+    inp = psbt.inputs[0]
+    pub = root.derive(path).get_public_key()
+    inp.witness_utxo = TransactionOutput(value=100_000, script_pubkey=script.p2tr(pub))
+    inp.taproot_bip32_derivations = {
+        pub: ([], DerivationPath(b"\x00\x00\x00\x00", path))
+    }
+
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+    signer = PSBTSigner(wallet, psbt.to_string(), FORMAT_NONE)
+    assert signer.zero_fingerprints_filled == 1
+    signer.sign(trim=False)
+    assert signer.psbt.inputs[0].taproot_key_sig is not None
+
+
+def _write_sd_psbt(mocker, tmp_path, psbt_b64):
+    import base64
+
+    (tmp_path / "sp.psbt").write_bytes(base64.b64decode(psbt_b64))
+    mocker.patch("krux.settings.SD_PATH", str(tmp_path).lstrip("/"))
+
+
+def test_sd_load_does_not_reread_a_rejected_psbt(mocker, m5stickv, tmp_path):
+    """validate() rejecting a fully parsed PSBT is final, no compressed re-read."""
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    other = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"], "pass"))
+    _write_sd_psbt(mocker, tmp_path, _build_sp_psbt()[0])
+    spy = mocker.spy(SilentPaymentsPSBT, "read_from")
+
+    with pytest.raises(ValueError, match="Invalid PSBT: .*controlled by this seed"):
+        PSBTSigner(other, None, FORMAT_NONE, psbt_filename="sp.psbt")
+    assert spy.call_count == 1
+
+
+def test_sd_compressed_fallback_refuses_sp_psbt_with_foreign_input(
+    mocker, m5stickv, tmp_path
+):
+    """A compressed read drops final witnesses, so an SP PSBT with an input
+    this seed does not own (here a NUMS script path) is refused, instead of
+    losing the other signer's witness."""
+    from embit.script import Witness
+    from krux.psbt import PSBTSigner
+    from krux.key import Key, TYPE_SINGLESIG
+    from krux.wallet import Wallet
+    from krux.qr import FORMAT_NONE
+
+    psbt = SilentPaymentsPSBT.from_string(_build_sp_psbt_taproot_input()[0])
+    merkle_root = bytes([0x42] * 32)
+    output_key = ec.NUMS_PUBKEY.taproot_tweak(merkle_root)
+    inp = SPInputScope()
+    inp.txid = bytes([0xEF] * 32)
+    inp.vout = 1
+    inp.sequence = 0xFFFFFFFE
+    inp.witness_utxo = TransactionOutput(
+        value=50_000, script_pubkey=Script(b"\x51\x20" + output_key.xonly())
+    )
+    inp.taproot_internal_key = ec.NUMS_PUBKEY
+    inp.taproot_merkle_root = merkle_root
+    inp.final_scriptwitness = Witness(
+        [b"\x01" * 64, b"\x51", b"\xc0" + ec.NUMS_PUBKEY.xonly()]
+    )
+    psbt.tx_modifiable_flags = 3
+    psbt.add_input(inp)
+    psbt.tx_modifiable_flags = 0
+    _write_sd_psbt(mocker, tmp_path, psbt.to_string())
+    mocker.patch.object(
+        PSBTSigner, "validate", side_effect=MemoryError("memory allocation failed")
+    )
+
+    wallet = Wallet(Key(TEST_MNEMONIC, TYPE_SINGLESIG, NETWORKS["test"]))
+    with pytest.raises(ValueError, match="too large to keep other inputs"):
+        PSBTSigner(wallet, None, FORMAT_NONE, psbt_filename="sp.psbt")

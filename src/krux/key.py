@@ -154,7 +154,7 @@ DERIVATION_PATH_SYMBOL = "↳"
 
 # Groups the BIP-352 silent payment keys derived for a Key
 SilentPaymentKeys = namedtuple(
-    "SilentPaymentKeys", ["scan_privkey", "spend_privkey", "spend_pubkey"]
+    "SilentPaymentKeys", ["scan_privkey", "scan_pubkey", "spend_pubkey"]
 )
 
 
@@ -202,12 +202,11 @@ class Key:
             )
         else:
             self.derivation = derivation
-        self.account = self.root.derive(self.derivation).to_public()
+        account = self.root.derive(self.derivation)
+        self.account = account.to_public()
 
         self.sp_keys = (
-            self._derive_sp_keys(self.derivation)
-            if policy_type == TYPE_SILENT_PAYMENT
-            else None
+            Key._derive_sp_keys(account) if policy_type == TYPE_SILENT_PAYMENT else None
         )
 
     def __eq__(self, other):
@@ -288,12 +287,14 @@ class Key:
         )
         return ser
 
-    def _derive_sp_keys(self, derivation):
-        """Derives the BIP-352 scan/spend keys under the given SP derivation"""
-        scan_privkey = self.root.derive(derivation + "/1h/0").key
-        spend_privkey = self.root.derive(derivation + "/0h/0").key
+    @staticmethod
+    def _derive_sp_keys(account):
+        """Derives the BIP-352 scan/spend keys under the given SP account node"""
+        scan_privkey = account.derive("m/1h/0").key
         return SilentPaymentKeys(
-            scan_privkey, spend_privkey, spend_privkey.get_public_key()
+            scan_privkey,
+            scan_privkey.get_public_key(),
+            account.derive("m/0h/0").key.get_public_key(),
         )
 
     def sp_scan_key(self, network_name):
@@ -322,24 +323,6 @@ class Key:
             self.sp_keys.scan_privkey, self.sp_keys.spend_pubkey, network=network_name
         )
 
-    def sp_detection_keys(self):
-        """Returns the wallet's BIP-352 keys for own SP-output detection.
-
-        The scan/spend keys are deterministic from the seed, so they are
-        derived even when the wallet was not loaded in Silent Payments policy
-        type. This lets the review screen recognize SP change/self-transfer
-        outputs regardless of the loaded policy type. Derivation assumes the
-        default SP account matching this wallet's account index; a different
-        SP account fails the ownership check safely (output stays a spend).
-        """
-        if self.sp_keys is not None:
-            return self.sp_keys
-        return self._derive_sp_keys(
-            Key.get_default_derivation(
-                TYPE_SILENT_PAYMENT, self.network, self.account_index
-            )
-        )
-
     @staticmethod
     def pick_final_word(entropy, words):
         """Returns a random final word with a valid checksum for the given list of
@@ -358,7 +341,7 @@ class Key:
             return DER_SINGLE % (
                 SINGLESIG_SCRIPT_PURPOSE[script_type],
                 network["bip32"],
-                account,
+                0 if account is None else account,
             )
         if policy_type == TYPE_MULTISIG:
             if script_type == P2SH:
