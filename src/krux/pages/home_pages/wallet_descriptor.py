@@ -353,7 +353,6 @@ class WalletDescriptor(Page):
                 return MENU_CONTINUE
 
         # Display wallet and confirm loading
-        self.ctx.display.clear()
         self.display_loading_wallet(wallet)
         if self.prompt(t("Load?"), BOTTOM_PROMPT_LINE):
             self.ctx.wallet = wallet
@@ -383,12 +382,19 @@ class WalletDescriptor(Page):
         def draw_header():
             nonlocal offset_y
             self.ctx.display.clear()
-            self.ctx.display.draw_hcentered_text(wallet.label, DEFAULT_PADDING)
-            offset_y = DEFAULT_PADDING + (3 * FONT_HEIGHT) // 2
+            offset_y = DEFAULT_PADDING
+            self.ctx.display.draw_hcentered_text(wallet.label, offset_y)
+            if wallet.descriptor.is_basic_multisig:
+                quorum = t("%d of %d multisig") % (
+                    wallet.policy["m"],
+                    wallet.policy["n"],
+                )
+                if quorum != wallet.label:
+                    offset_y += FONT_HEIGHT
+                    self.ctx.display.draw_hcentered_text(quorum, offset_y)
+            offset_y += (3 * FONT_HEIGHT) // 2
 
-        offset_y = DEFAULT_PADDING
-        self.ctx.display.draw_hcentered_text(wallet.label, offset_y)
-        offset_y += (3 * FONT_HEIGHT) // 2
+        draw_header()
         our_key_indexes_chars = []
         unused_key_index = None
         for i, key in enumerate(wallet.descriptor.keys):

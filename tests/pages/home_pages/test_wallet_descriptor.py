@@ -1025,5 +1025,52 @@ def test_load_key_value_file_without_name(
     )
     assert ctx.wallet.is_loaded()
     assert ctx.wallet.label == "2 of 3 multisig"
-    ctx.display.draw_hcentered_text.assert_any_call("2 of 3 multisig", mocker.ANY)
+    # quorum line is skipped when the label already says it
+    assert (
+        ctx.display.draw_hcentered_text.call_args_list.count(
+            mocker.call("2 of 3 multisig", mocker.ANY)
+        )
+        == 1
+    )
+    assert ctx.input.wait_for_button.call_count == len(btn_seq)
+
+
+@pytest.mark.parametrize(
+    "name, policy, quorum",
+    [
+        ("BlueWallet Multisig Wallet", "2 of 3", "2 of 3 multisig"),
+        ("2 of 3 multisig", "1 of 3", "1 of 3 multisig"),
+    ],
+    ids=["name-only", "forged-label"],
+)
+def test_load_multisig_shows_quorum(
+    mocker, m5stickv, wallet_tdata, name, policy, quorum
+):
+    """The computed m of n is drawn under the label, whatever the file calls itself"""
+    from krux.pages.home_pages.wallet_descriptor import WalletDescriptor
+    from krux.wallet import Wallet
+    from krux.input import BUTTON_ENTER
+    from krux.qr import FORMAT_NONE
+    from krux.pages.qr_capture import QRCodeCapture
+
+    wallet_data = wallet_tdata.BLUEWALLET_MULTISIG_WALLET_DATA.replace(
+        "Name: BlueWallet Multisig Wallet", "Name: " + name
+    ).replace("Policy: 2 of 3", "Policy: " + policy)
+
+    btn_seq = [
+        BUTTON_ENTER,  # Wallet output descriptor not found. Load?
+        BUTTON_ENTER,  # Load from camera
+        BUTTON_ENTER,  # Load?
+    ]
+    ctx = create_ctx(mocker, btn_seq, Wallet(wallet_tdata.MULTISIG_NATIVE_SW_1))
+    mocker.patch.object(
+        QRCodeCapture, "qr_capture_loop", new=lambda self: (wallet_data, FORMAT_NONE)
+    )
+
+    WalletDescriptor(ctx).wallet()
+
+    assert ctx.wallet.is_loaded()
+    assert ctx.wallet.label == name
+    ctx.display.draw_hcentered_text.assert_any_call(name, mocker.ANY)
+    ctx.display.draw_hcentered_text.assert_any_call(quorum, mocker.ANY)
     assert ctx.input.wait_for_button.call_count == len(btn_seq)
